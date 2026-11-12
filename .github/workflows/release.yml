@@ -102,5 +102,5 @@ jobs:
           fi
 
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          docker push "$IMAGE"
+          docker push --platform linux/amd64 "$IMAGE"
           printf 'Published `%s` after a successful startup check.\n' "$IMAGE" >> "$GITHUB_STEP_SUMMARY"
