@@ -1,0 +1,350 @@
+package service_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/nexspence-oss/nexspence/internal/auth"
+	"github.com/nexspence-oss/nexspence/internal/config"
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/service"
+	"github.com/nexspence-oss/nexspence/internal/testutil"
+)
+
+// mockLDAP implements auth.LDAPAuthenticator for testing.
+type mockLDAP struct {
+	user    *auth.LDAPUser
+	err     error
+	testErr error
+	calls   int
+}
+
+func (m *mockLDAP) Authenticate(_ context.Context, _, _ string) (*auth.LDAPUser, error) {
+	m.calls++
+	return m.user, m.err
+}
+func (m *mockLDAP) TestConnection(_ context.Context) error { return m.testErr }
+
+// newUserSvcWithLDAP creates a UserService with LDAP, no config (admin group empty).
+func newUserSvcWithLDAP(ldap auth.LDAPAuthenticator) (*service.UserService, *testutil.UserRepo) {
+	users := testutil.NewUserRepo()
+	roles := testutil.NewRoleRepo()
+	authSvc := auth.NewService("test-secret-32-chars-long-here!!", 1, 4)
+	svc := service.NewUserService(users, roles, authSvc, zap.NewNop().Sugar()).
+		WithLDAP(ldap, config.LDAPConfig{})
+	return svc, users
+}
+
+// newUserSvcWithLDAPConfig creates a UserService with LDAP config and pre-seeded roles.
+func newUserSvcWithLDAPConfig(ldap auth.LDAPAuthenticator, cfg config.LDAPConfig, roles ...*domain.Role) (*service.UserService, *testutil.UserRepo, *testutil.RoleRepo) {
+	userRepo := testutil.NewUserRepo()
+	roleRepo := testutil.NewRoleRepo(roles...)
+	authSvc := auth.NewService("test-secret-32-chars-long-here!!", 1, 4)
+	svc := service.NewUserService(userRepo, roleRepo, authSvc, zap.NewNop().Sugar()).
+		WithLDAP(ldap, cfg)
+	return svc, userRepo, roleRepo
+}
+
+func TestLogin_LDAPSuccess_NewUser(t *testing.T) {
+	mock := &mockLDAP{user: &auth.LDAPUser{
+		Username: "alice", Email: "alice@corp.com",
+		FirstName: "Alice", LastName: "Smith",
+		GroupsSearched: true, Groups: []string{"developers"},
+	}}
+	svc, users := newUserSvcWithLDAP(mock)
+
+	token, u, err := svc.Login(context.Background(), "alice", "secret")
+	require.NoError(t, err)
+	assert.NotEmpty(t, token)
+	assert.Equal(t, "alice", u.Username)
+	assert.Equal(t, domain.UserSourceLDAP, u.Source)
+
+	// User should be auto-created in local DB.
+	created, _ := users.Get(context.Background(), "alice")
+	require.NotNil(t, created)
+	assert.Equal(t, "alice@corp.com", created.Email)
+}
+
+func TestAuthenticateBasicLDAPCacheIsDisabledByDefault(t *testing.T) {
+	ldap := &mockLDAP{user: &auth.LDAPUser{Username: "alice"}}
+	svc, _ := newUserSvcWithLDAP(ldap)
+	for range 2 {
+		_, err := svc.AuthenticateBasic(context.Background(), "alice", "secret")
+		require.NoError(t, err)
+	}
+	require.Equal(t, 2, ldap.calls, "zero LDAP cache TTL must preserve live directory authentication")
+}
+
+func TestAuthenticateBasicCachesLDAPAuthenticationWhenConfigured(t *testing.T) {
+	ldap := &mockLDAP{user: &auth.LDAPUser{Username: "alice", Email: "alice@example.com"}}
+	svc, _, _ := newUserSvcWithLDAPConfig(ldap, config.LDAPConfig{BasicAuthCacheTTL: time.Minute})
+	for range 2 {
+		_, err := svc.AuthenticateBasic(context.Background(), "alice", "secret")
+		require.NoError(t, err)
+	}
+	require.Equal(t, 1, ldap.calls, "a successful LDAP Basic-auth verification should be reused within its TTL")
+}
+
+func TestAuthenticateBasicLDAPCacheNormalizesUsername(t *testing.T) {
+	ldap := &mockLDAP{user: &auth.LDAPUser{Username: "alice"}}
+	svc, _, _ := newUserSvcWithLDAPConfig(ldap, config.LDAPConfig{BasicAuthCacheTTL: time.Minute})
+	_, err := svc.AuthenticateBasic(context.Background(), "alice", "secret")
+	require.NoError(t, err)
+	_, err = svc.AuthenticateBasic(context.Background(), "ALICE", "secret")
+	require.NoError(t, err)
+	require.Equal(t, 1, ldap.calls, "LDAP cache keys must use the normalized directory username")
+}
+
+func TestLogin_LDAPSuccess_ExistingUser_ProfileSynced(t *testing.T) {
+	mock := &mockLDAP{user: &auth.LDAPUser{
+		Username: "bob", Email: "bob@new.com", FirstName: "Robert",
+	}}
+	svc, users := newUserSvcWithLDAP(mock)
+
+	// Pre-create user as LDAP type with old email.
+	existing := &domain.User{
+		Username: "bob", Email: "bob@old.com", FirstName: "Bob",
+		Status: domain.UserStatusActive, Source: domain.UserSourceLDAP,
+	}
+	require.NoError(t, users.Create(context.Background(), existing))
+
+	_, u, err := svc.Login(context.Background(), "bob", "pass")
+	require.NoError(t, err)
+	assert.Equal(t, "bob@new.com", u.Email)
+	assert.Equal(t, "Robert", u.FirstName)
+}
+
+func TestLogin_LDAPFail_WrongPassword(t *testing.T) {
+	mock := &mockLDAP{err: errors.New("invalid credentials")}
+	svc, _ := newUserSvcWithLDAP(mock)
+
+	_, _, err := svc.Login(context.Background(), "carol", "wrong")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "LDAP authentication failed")
+}
+
+func TestLogin_LDAPDisabled_FallsBackToLocal(t *testing.T) {
+	users := testutil.NewUserRepo()
+	roles := testutil.NewRoleRepo()
+	authSvc := auth.NewService("test-secret-32-chars-long-here!!", 1, 4)
+	svc := service.NewUserService(users, roles, authSvc, zap.NewNop().Sugar()) // no LDAP
+
+	hash, _ := authSvc.HashPassword("mypass")
+	u := &domain.User{
+		Username: "dave", Status: domain.UserStatusActive,
+		Source: domain.UserSourceLocal,
+	}
+	u.PasswordHash = hash
+	require.NoError(t, users.Create(context.Background(), u))
+
+	token, _, err := svc.Login(context.Background(), "dave", "mypass")
+	require.NoError(t, err)
+	assert.NotEmpty(t, token)
+}
+
+func TestLogin_LDAP_DisabledUser_Rejected(t *testing.T) {
+	mock := &mockLDAP{user: &auth.LDAPUser{Username: "eve"}}
+	svc, users := newUserSvcWithLDAP(mock)
+
+	disabled := &domain.User{
+		Username: "eve", Status: domain.UserStatusDisabled,
+		Source: domain.UserSourceLDAP,
+	}
+	require.NoError(t, users.Create(context.Background(), disabled))
+
+	_, _, err := svc.Login(context.Background(), "eve", "pass")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not active")
+}
+
+// ── Phase 60: LDAP External Role Mapping ──────────────────────────────────────
+
+func TestLogin_LDAP_GroupNameMatchesRole(t *testing.T) {
+	// LDAP user in group "developers" should get the role named "developers".
+	devRole := &domain.Role{ID: "role-dev", Name: "developers"}
+	mock := &mockLDAP{user: &auth.LDAPUser{
+		Username: "frank", Email: "frank@corp.com",
+		GroupsSearched: true, Groups: []string{"developers"},
+	}}
+	svc, _, roleRepo := newUserSvcWithLDAPConfig(mock, config.LDAPConfig{}, devRole)
+
+	_, u, err := svc.Login(context.Background(), "frank", "pass")
+	require.NoError(t, err)
+	assert.Contains(t, u.Roles, "developers")
+
+	userRoles, _ := roleRepo.GetUserRoles(context.Background(), u.ID)
+	roleNames := make([]string, 0, len(userRoles))
+	for _, r := range userRoles {
+		roleNames = append(roleNames, r.Name)
+	}
+	assert.Contains(t, roleNames, "developers")
+}
+
+func TestLogin_LDAP_AdminGroupGrantsNxAdmin(t *testing.T) {
+	// LDAP user in the configured admin_group gets the nx-admin role.
+	adminRole := &domain.Role{ID: "role-admin", Name: "nx-admin"}
+	mock := &mockLDAP{user: &auth.LDAPUser{
+		Username: "grace", Email: "grace@corp.com",
+		GroupsSearched: true, Groups: []string{"infra-admins"},
+	}}
+	cfg := config.LDAPConfig{AdminGroup: "infra-admins"}
+	svc, _, roleRepo := newUserSvcWithLDAPConfig(mock, cfg, adminRole)
+
+	_, u, err := svc.Login(context.Background(), "grace", "pass")
+	require.NoError(t, err)
+	assert.Contains(t, u.Roles, "nx-admin")
+
+	userRoles, _ := roleRepo.GetUserRoles(context.Background(), u.ID)
+	roleNames := make([]string, 0, len(userRoles))
+	for _, r := range userRoles {
+		roleNames = append(roleNames, r.Name)
+	}
+	assert.Contains(t, roleNames, "nx-admin")
+}
+
+func TestLogin_LDAP_RoleMappingsConfig(t *testing.T) {
+	// LDAP group "dev-team" mapped via role_mappings to role "developers".
+	devRole := &domain.Role{ID: "role-dev", Name: "developers"}
+	mock := &mockLDAP{user: &auth.LDAPUser{
+		Username: "henry", Email: "henry@corp.com",
+		GroupsSearched: true, Groups: []string{"dev-team"},
+	}}
+	cfg := config.LDAPConfig{
+		RoleMappings: map[string]string{"dev-team": "developers"},
+	}
+	svc, _, roleRepo := newUserSvcWithLDAPConfig(mock, cfg, devRole)
+
+	_, u, err := svc.Login(context.Background(), "henry", "pass")
+	require.NoError(t, err)
+	assert.Contains(t, u.Roles, "developers")
+
+	userRoles, _ := roleRepo.GetUserRoles(context.Background(), u.ID)
+	roleNames := make([]string, 0, len(userRoles))
+	for _, r := range userRoles {
+		roleNames = append(roleNames, r.Name)
+	}
+	assert.Contains(t, roleNames, "developers")
+}
+
+func TestLogin_LDAP_ReplaceSemantics(t *testing.T) {
+	// LDAP user previously had "old-role". On next login with group "developers",
+	// REPLACE semantics: old-role is removed, developers is set.
+	oldRole := &domain.Role{ID: "role-old", Name: "old-role"}
+	devRole := &domain.Role{ID: "role-dev", Name: "developers"}
+	mock := &mockLDAP{user: &auth.LDAPUser{
+		Username: "ivan", Email: "ivan@corp.com",
+		GroupsSearched: true, Groups: []string{"developers"},
+	}}
+	svc, userRepo, roleRepo := newUserSvcWithLDAPConfig(mock, config.LDAPConfig{}, oldRole, devRole)
+
+	// Pre-create user with old-role assigned.
+	existing := &domain.User{
+		Username: "ivan", Email: "ivan@corp.com",
+		Status: domain.UserStatusActive, Source: domain.UserSourceLDAP,
+	}
+	require.NoError(t, userRepo.Create(context.Background(), existing))
+	require.NoError(t, roleRepo.SetUserRoles(context.Background(), existing.ID, []string{"role-old"}))
+
+	_, u, err := svc.Login(context.Background(), "ivan", "pass")
+	require.NoError(t, err)
+
+	userRoles, _ := roleRepo.GetUserRoles(context.Background(), u.ID)
+	roleNames := make([]string, 0, len(userRoles))
+	for _, r := range userRoles {
+		roleNames = append(roleNames, r.Name)
+	}
+	assert.Contains(t, roleNames, "developers")
+	assert.NotContains(t, roleNames, "old-role", "REPLACE semantics: old-role should be removed")
+}
+
+func TestLogin_LDAP_NewUser_DoesNotHaveGroupsAsRoles(t *testing.T) {
+	// Regression: Roles field in users.Create must NOT be set to lu.Groups.
+	// That field doesn't write to user_roles table and was a stale attempt.
+	mock := &mockLDAP{user: &auth.LDAPUser{
+		Username: "julia", Email: "julia@corp.com",
+		GroupsSearched: true, Groups: []string{"some-ldap-group"},
+	}}
+	svc, userRepo := newUserSvcWithLDAP(mock)
+
+	_, _, err := svc.Login(context.Background(), "julia", "pass")
+	require.NoError(t, err)
+
+	created, _ := userRepo.Get(context.Background(), "julia")
+	require.NotNil(t, created)
+	// Roles on the User struct should not be populated from LDAP groups
+	// (those are not DB-backed role assignments).
+	assert.Empty(t, created.Roles, "user.Roles should not be set from LDAP Groups at create time")
+}
+
+// ── #488: group-search outcome must gate the role sync ───────────────────────
+
+// seedLDAPUserWithRole creates an active LDAP-sourced user holding roleID.
+func seedLDAPUserWithRole(t *testing.T, users *testutil.UserRepo, roles *testutil.RoleRepo, username, roleID string) *domain.User {
+	t.Helper()
+	u := &domain.User{
+		Username: username, Email: username + "@corp.com",
+		Status: domain.UserStatusActive, Source: domain.UserSourceLDAP,
+	}
+	require.NoError(t, users.Create(context.Background(), u))
+	require.NoError(t, roles.SetUserRoles(context.Background(), u.ID, []string{roleID}))
+	return u
+}
+
+func roleNamesOf(t *testing.T, roles *testutil.RoleRepo, userID string) []string {
+	t.Helper()
+	userRoles, err := roles.GetUserRoles(context.Background(), userID)
+	require.NoError(t, err)
+	names := make([]string, 0, len(userRoles))
+	for _, r := range userRoles {
+		names = append(names, r.Name)
+	}
+	return names
+}
+
+func TestLogin_LDAP_GroupSearchFailed_KeepsExistingRoles(t *testing.T) {
+	// A failed directory search is "unknown", not "zero groups": the manually
+	// granted role must survive the login.
+	manual := &domain.Role{ID: "role-manual", Name: "release-manager"}
+	mock := &mockLDAP{user: &auth.LDAPUser{
+		Username:       "kate",
+		GroupSearchErr: "LDAP Result Code 51 \"Busy\"",
+	}}
+	svc, users, roles := newUserSvcWithLDAPConfig(mock, config.LDAPConfig{}, manual)
+	seedLDAPUserWithRole(t, users, roles, "kate", "role-manual")
+
+	_, u, err := svc.Login(context.Background(), "kate", "pass")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"release-manager"}, roleNamesOf(t, roles, u.ID))
+	assert.Equal(t, []string{"release-manager"}, u.Roles, "JWT roles must reflect the untouched assignment")
+}
+
+func TestLogin_LDAP_GroupSearchNotConfigured_KeepsExistingRoles(t *testing.T) {
+	// No group_base/group_filter → no search ran → nothing to sync from.
+	manual := &domain.Role{ID: "role-manual", Name: "release-manager"}
+	mock := &mockLDAP{user: &auth.LDAPUser{Username: "leo"}} // GroupsSearched=false, no error
+	svc, users, roles := newUserSvcWithLDAPConfig(mock, config.LDAPConfig{}, manual)
+	seedLDAPUserWithRole(t, users, roles, "leo", "role-manual")
+
+	_, u, err := svc.Login(context.Background(), "leo", "pass")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"release-manager"}, roleNamesOf(t, roles, u.ID))
+}
+
+func TestLogin_LDAP_GroupSearchEmptyResult_ReplacesRoles(t *testing.T) {
+	// A successful search returning zero groups is a confirmed answer:
+	// REPLACE semantics still drop the stale role.
+	manual := &domain.Role{ID: "role-manual", Name: "release-manager"}
+	mock := &mockLDAP{user: &auth.LDAPUser{Username: "mia", GroupsSearched: true}}
+	svc, users, roles := newUserSvcWithLDAPConfig(mock, config.LDAPConfig{}, manual)
+	seedLDAPUserWithRole(t, users, roles, "mia", "role-manual")
+
+	_, u, err := svc.Login(context.Background(), "mia", "pass")
+	require.NoError(t, err)
+	assert.Empty(t, roleNamesOf(t, roles, u.ID))
+}

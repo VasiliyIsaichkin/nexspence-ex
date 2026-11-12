@@ -1,0 +1,279 @@
+package apt
+
+// Group index merging (#99 phase 2): the Packages index answers 200-empty
+// for members without matching debs, shadowing later members under
+// first-non-404 fan-out, and a single member's index hides the others'
+// packages. Stanzas are unioned, deduped by Filename.
+//
+// Release/InRelease (#221) are rebuilt rather than relayed: a member's own
+// document describes that member's indexes, while the group serves the union,
+// so its Architectures line and checksums would describe something the client
+// never downloads — a hash-sum mismatch, or an architecture apt never looks
+// for. Release.gpg keeps plain fan-out: a detached signature can only be made
+// with a key, and the merger has no way to answer "not applicable" (404)
+// distinct from "merge failed", which degrades to a member's raw body.
+
+import (
+	"context"
+	"path"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/nexspence-oss/nexspence/internal/formats"
+)
+
+// GroupIndexSourcePath implements formats.GroupIndexMerger. The .gz flavor
+// fans out on the PLAIN document — members serve plain text, the merger
+// gzips the merged result.
+func (h *Handler) GroupIndexSourcePath(p string) (string, bool) {
+	if !strings.HasPrefix(p, "/dists/") || !validDist(p) {
+		// Not merged: a malformed suite would be echoed into the group's own
+		// Release. The plain fan-out reaches members that refuse it.
+		return "", false
+	}
+	if strings.Contains(p, "/Packages") {
+		return strings.TrimSuffix(p, ".gz"), true
+	}
+	// The members' own Release documents are the source: they are what names
+	// the architectures and components the group has to cover.
+	switch path.Base(p) {
+	case "Release", "InRelease":
+		return p, true
+	}
+	return "", false
+}
+
+// MergeGroupIndex implements formats.GroupIndexMerger.
+func (h *Handler) MergeGroupIndex(groupName, p string, parts []formats.GroupIndexPart) ([]byte, string, error) {
+	return h.MergeGroupIndexWithFetch(groupName, p, parts, nil)
+}
+
+// MergeGroupIndexWithFetch implements formats.GroupIndexDependentMerger.
+func (h *Handler) MergeGroupIndexWithFetch(groupName, p string, parts []formats.GroupIndexPart,
+	fetch formats.GroupIndexFetcher,
+) ([]byte, string, error) {
+	if base := path.Base(p); base == "Release" || base == "InRelease" {
+		return h.mergeRelease(groupName, p, base == "InRelease", parts, fetch)
+	}
+	return mergePackages(p, parts), packagesContentType(p), nil
+}
+
+func packagesContentType(p string) string {
+	if strings.HasSuffix(p, ".gz") {
+		return "application/x-gzip"
+	}
+	return "text/plain; charset=utf-8"
+}
+
+// mergePackages unions the members' stanzas, deduped by Filename (first member
+// wins), and gzips the result for the .gz flavor.
+func mergePackages(p string, parts []formats.GroupIndexPart) []byte {
+	var stanzas []string
+	seen := map[string]bool{}
+	for _, part := range parts {
+		for _, stanza := range strings.Split(strings.TrimSpace(string(part.Body)), "\n\n") {
+			stanza = strings.TrimSpace(stanza)
+			if stanza == "" {
+				continue
+			}
+			key := stanzaFilename(stanza)
+			if key != "" && seen[key] {
+				continue // first member wins per Filename
+			}
+			if key != "" {
+				seen[key] = true
+			}
+			stanzas = append(stanzas, stanza)
+		}
+	}
+
+	var sb strings.Builder
+	for _, s := range stanzas {
+		sb.WriteString(s)
+		sb.WriteString("\n\n")
+	}
+	plain := []byte(sb.String())
+
+	if strings.HasSuffix(p, ".gz") {
+		return gzipBytes(plain)
+	}
+	return plain
+}
+
+// mergeRelease builds the group's own Release: every architecture and component
+// its members declare, with checksums taken over the merged Packages indexes the
+// group itself serves at those paths.
+func (h *Handler) mergeRelease(groupName, p string, inline bool, parts []formats.GroupIndexPart,
+	fetch formats.GroupIndexFetcher,
+) ([]byte, string, error) {
+	const contentType = "text/plain; charset=utf-8"
+
+	dist := releaseDist(p)
+	// One slot of the cap is "all", which indexArchs adds to every Release.
+	archs := unionReleaseField(parts, "Architectures", maxReleaseArchs-1, func(v string) bool { return v != "all" })
+	components := unionReleaseField(parts, "Components", maxReleaseComponents, func(string) bool { return true })
+	if len(components) == 0 {
+		components = []string{"main"}
+	}
+
+	// binary-all is vouched for when a member publishes it — every Nexspence
+	// hosted member declares "all", so an all-only group keeps working. Members
+	// that never declare it (an Ubuntu archive proxy) are not asked for it: a
+	// proxy has no negative cache, so each Release would cost them a live
+	// upstream round trip per component for an index that does not exist.
+	indexed := archs
+	if releaseDeclaresAll(parts) {
+		indexed = indexArchs(archs)
+	}
+
+	var files []releaseIndexFile
+	if fetch != nil {
+		for _, component := range components {
+			for _, arch := range indexed {
+				for _, suffix := range []string{"", ".gz"} {
+					rel := component + "/binary-" + arch + "/Packages" + suffix
+					body, err := fetch("/dists/" + dist + "/" + rel)
+					if err != nil {
+						// A path no member serves is a path the group does not
+						// serve either, so it belongs in no checksum section.
+						continue
+					}
+					files = append(files, releaseIndexFile{relPath: rel, body: body})
+				}
+			}
+		}
+	}
+
+	body := renderRelease(dist, archs, components, h.groupReleaseDate(groupName, parts), files)
+	if !inline {
+		return body, contentType, nil
+	}
+
+	// Signed with the GROUP's own key, never a member's: a member's key vouches
+	// for that member's index, not for a union it never served. An unsigned
+	// group keeps serving the plain document, which is what [trusted=yes]
+	// sources expect.
+	repo, _ := h.deps.Repos.Get(context.Background(), groupName) // unreadable group == unsigned group
+	if repo == nil || !signingConfigured(repo) {
+		return body, contentType, nil
+	}
+	signed, err := clearSign(repo, body)
+	if err != nil {
+		return nil, "", err
+	}
+	return signed, contentType, nil
+}
+
+// releaseName is what an architecture or component may be called. A member's
+// Release is untrusted input — for a proxy member it is whatever the upstream
+// chose to serve — and these values are spliced into the paths the group then
+// asks itself for, so anything that is not a plain name is dropped instead of
+// becoming a path.
+var releaseName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]*$`)
+
+// The index matrix a group will vouch for is bounded: one member declaring
+// thousands of architectures would otherwise turn a single Release request into
+// that many fan-outs across every member. Real distributions are far below
+// these limits (Debian ships ~10 architectures and 3 components).
+const (
+	maxReleaseArchs      = 64
+	maxReleaseComponents = 32
+)
+
+// unionReleaseField collects the values of a space-separated Release header
+// across members, keeping the well-formed ones that keep reports, sorted so the
+// document is stable and capped at limit.
+func unionReleaseField(parts []formats.GroupIndexPart, field string, limit int, keep func(string) bool) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, part := range parts {
+		for _, v := range strings.Fields(releaseHeader(string(part.Body), field)) {
+			if !releaseName.MatchString(v) || !keep(v) || seen[v] {
+				continue
+			}
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	sort.Strings(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// releaseDeclaresAll reports whether any member's Release lists "all" among
+// its Architectures, i.e. whether some member publishes a binary-all index.
+func releaseDeclaresAll(parts []formats.GroupIndexPart) bool {
+	for _, part := range parts {
+		for _, v := range strings.Fields(releaseHeader(string(part.Body), "Architectures")) {
+			if v == "all" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// releaseDateOf is the newest Date the members declare. The document has to be
+// byte-identical across requests — apt fetches Release and its signature
+// separately and verifies one against the other — so it tracks the members'
+// content rather than the wall clock, exactly as a single repository's does.
+// groupReleaseDate is the group's Release Date: its members' newest, and never
+// earlier than the group's last configuration change — dropping the member
+// with the newest Date must not make the group's Release older than the one
+// a client cached (#728).
+func (h *Handler) groupReleaseDate(groupName string, parts []formats.GroupIndexPart) string {
+	date := releaseDateOf(parts)
+	if h.deps.Repos == nil {
+		return date
+	}
+	group, err := h.deps.Repos.Get(context.Background(), groupName)
+	if err != nil || group == nil {
+		return date
+	}
+	if d, err := time.Parse(releaseDateLayout, date); err == nil && group.UpdatedAt.After(d) {
+		return group.UpdatedAt.UTC().Format(releaseDateLayout)
+	}
+	return date
+}
+
+func releaseDateOf(parts []formats.GroupIndexPart) string {
+	var newest time.Time
+	for _, part := range parts {
+		d, err := time.Parse(releaseDateLayout, releaseHeader(string(part.Body), "Date"))
+		if err == nil && d.After(newest) {
+			newest = d
+		}
+	}
+	if newest.IsZero() {
+		return time.Now().UTC().Format(releaseDateLayout)
+	}
+	return newest.UTC().Format(releaseDateLayout)
+}
+
+// releaseHeader reads a single-line "Field: value" header out of a Release
+// document, skipping the indented checksum lines.
+func releaseHeader(doc, field string) string {
+	for _, line := range strings.Split(doc, "\n") {
+		if strings.HasPrefix(line, " ") {
+			continue
+		}
+		if v, found := strings.CutPrefix(line, field+":"); found {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// stanzaFilename extracts the Filename: field used as the dedup key.
+func stanzaFilename(stanza string) string {
+	for _, line := range strings.Split(stanza, "\n") {
+		if strings.HasPrefix(line, "Filename:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "Filename:"))
+		}
+	}
+	return ""
+}

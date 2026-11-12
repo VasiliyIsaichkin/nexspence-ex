@@ -1,0 +1,141 @@
+package formats
+
+import (
+	"context"
+	"time"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/repository"
+	"github.com/nexspence-oss/nexspence/internal/storage"
+)
+
+// Deps holds all dependencies injected into every format handler.
+type Deps struct {
+	PublicOrigins []string
+	Repos         repository.RepositoryRepo
+	Components    repository.ComponentRepo
+	Assets        repository.AssetRepo
+	Blobs         repository.BlobStoreRepo
+	BlobStore     storage.BlobStore // default / fallback store
+	Registry      *storage.Registry // optional: per-blob-store routing; nil disables
+	BaseURL       string
+	// Webhooks is optional — nil disables event delivery.
+	Webhooks domain.WebhookDispatcher
+	// Downloads is optional — nil disables download counting.
+	Downloads domain.DownloadCounter
+	// RoutingRules is optional — nil disables routing rule enforcement in group repos.
+	RoutingRules repository.RoutingRuleRepo
+	// RBAC is optional — nil disables caller-privilege checks a handler makes on
+	// its own behalf. It does not disable RBACMiddleware, which guards the
+	// request itself; this is for the paths a handler reaches that the request
+	// URL does not name, such as a blob mount's client-supplied source.
+	RBAC RBACChecker
+	// Scanner is optional — nil disables automatic vulnerability scanning of
+	// uploads.
+	Scanner ScanTrigger
+	// Publishes is optional — nil disables automatic promotion on publish
+	// (#542). It is told about client publishes into hosted repositories only.
+	Publishes PublishNotifier
+	// ScanResults is optional — the docker/oci pull gate (#641) reads the
+	// latest scan of an image from it. nil leaves the gate with no scans to
+	// read: a hosted repository with the gate on then refuses every image as
+	// unscanned, which is the safe reading of "nothing is known".
+	ScanResults repository.ScanResultRepo
+	// ScanPullUser is the account the image scanner pulls with (Trivy reads the
+	// image through this instance's own /v2/ API). The pull gate lets it
+	// through: an image a hosted repository refuses as unscanned could never
+	// be scanned otherwise. Empty exempts nobody.
+	ScanPullUser string
+	// Tokens mints a bearer token for a caller the request has already
+	// authenticated. It is optional — nil makes the handshakes that need one
+	// answer 503 rather than hand out a token nothing can validate.
+	Tokens TokenIssuer
+	// MaxUploadBytes caps the total size of a single staged blob upload. The
+	// /v2/ upload paths are exempt from the global request-body cap so large
+	// image layers are not truncated, which leaves this as their only bound.
+	// 0 disables the cap.
+	MaxUploadBytes int64
+	// MaxRewrittenMetadataBytes bounds buffered proxy metadata. Non-positive
+	// values use the default 32 MiB cap, including zero-value test configs.
+	MaxRewrittenMetadataBytes int64
+	// HelmIndexCacheTTL is how long a Helm proxy reuses an upstream index.yaml
+	// when resolving where a chart tarball comes from (config helm.index_cache_ttl).
+	// 0 fetches the index per lookup.
+	HelmIndexCacheTTL time.Duration
+}
+
+// TokenIssuer mints a bearer token for an already-authenticated caller.
+//
+// Some package managers log in over a protocol endpoint of their own before
+// they will upload — Conan's GET /v2/users/authenticate hands the client a
+// token it then sends as Bearer on every later request. The handler cannot
+// mint that itself, and importing internal/auth here would drag the whole
+// authentication service into the format layer, so it asks for the one method
+// it needs. *auth.Service satisfies this.
+type TokenIssuer interface {
+	// GenerateToken signs a token for the given user. The caller is expected to
+	// have been authenticated already: this issues credentials, it does not
+	// check them.
+	GenerateToken(userID, username string, roles []string) (string, error)
+}
+
+// ScopedTokenIssuer is implemented by token issuers that can embed an API
+// token's scopes into the minted token (*auth.Service does). A login
+// handshake authenticated with a scoped token must mint through it, so the
+// session is no wider than the token it came from (#292, #567).
+type ScopedTokenIssuer interface {
+	GenerateScopedToken(userID, username string, roles, scopes []string) (string, error)
+}
+
+// APITokenIssuer is implemented by token issuers that can bind the minted
+// token to the API token the caller logged in with (*auth.Service does): it
+// carries the token's scopes, names the token so deleting it revokes the
+// session, and expires no later than the token (#566, #567).
+type APITokenIssuer interface {
+	GenerateAPITokenJWT(userID, username string, roles, scopes []string, tokenID string, tokenExpiresAt *time.Time) (string, time.Time, error)
+}
+
+// ScanTrigger requests a background vulnerability scan of a stored component.
+//
+// It is the narrowest possible view of *service.ScanService, declared here for
+// the same reason RBACChecker is: internal/service already imports
+// internal/formats/base, so depending on it from this package would close a
+// cycle. Keeping it to one method also keeps the storage layer honest — it can
+// ask for a scan, and can do nothing else with the scanner.
+type ScanTrigger interface {
+	// TriggerAsync queues componentID for scanning and returns immediately. It
+	// is called on the upload path, so implementations must not block and must
+	// not report failure: a scan that cannot be queued is dropped, not raised.
+	TriggerAsync(componentID string)
+}
+
+// PublishNotifier is told that a client published an asset into a component
+// of a hosted repository, so an auto-promoting rule can pick it up (#542).
+//
+// Like ScanTrigger it is the narrowest view of a service (here
+// *service.PromotionService), declared here to avoid an import cycle. It runs
+// on the upload path: implementations record the publish and return — they
+// never evaluate or copy anything inline, and never fail the upload.
+type PublishNotifier interface {
+	NotifyPublished(ctx context.Context, repoName, componentID string)
+}
+
+// RBACChecker answers whether a caller may act on a path in a repository.
+//
+// It is declared here, as the subset of *service.RBACService a format handler
+// needs, rather than imported from internal/service: that package already
+// imports internal/formats/base, which imports this one, so depending on it the
+// other way would close a cycle.
+type RBACChecker interface {
+	// CanAccessRepo mirrors service.RBACService.CanAccessRepo. action is one of
+	// "read", "browse", "write", "delete"; path is the repository-relative asset
+	// path, which the implementation normalizes for OCI repositories so it is
+	// compared the way content selectors are written.
+	CanAccessRepo(ctx context.Context, userID string, roles []string,
+		repo *domain.Repository, path, action string) (bool, error)
+}
+
+// OCINameFilter loads the caller's privileges once for a whole catalog page scan.
+type OCINameFilter interface {
+	FilterOCIImageNames(context.Context, string, []string, *domain.Repository, []string) []string
+}

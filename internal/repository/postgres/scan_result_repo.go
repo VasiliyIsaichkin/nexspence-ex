@@ -1,0 +1,154 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/repository"
+)
+
+type scanResultRepo struct{ pool *pgxpool.Pool }
+
+// NewScanResultRepo returns a postgres-backed ScanResultRepo.
+func NewScanResultRepo(pool *pgxpool.Pool) *scanResultRepo {
+	return &scanResultRepo{pool: pool}
+}
+
+func (r *scanResultRepo) Insert(ctx context.Context, row *domain.ScanResultRow) error {
+	raw, _ := json.Marshal(row.Raw)
+	_, err := lockDB(ctx, r.pool).Exec(ctx, `
+		INSERT INTO scan_results
+		  (component_id, scanner, status, malicious, critical, high, medium, low, unknown, total, scanned_at, raw, error)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		row.ComponentID, row.Scanner, string(row.Status),
+		row.Malicious, row.Critical, row.High, row.Medium, row.Low, row.Unknown, row.Total,
+		row.ScannedAt, raw, row.Error,
+	)
+	return err
+}
+
+func (r *scanResultRepo) GetLatestByComponent(ctx context.Context, componentID string) (*domain.ScanResultRow, error) {
+	var (
+		row domain.ScanResultRow
+		raw []byte
+		st  string
+	)
+	err := lockDB(ctx, r.pool).QueryRow(ctx, `
+		SELECT id, component_id, scanner, status, malicious, critical, high, medium, low, unknown, total, scanned_at, raw, COALESCE(error,'')
+		FROM scan_results
+		WHERE component_id = $1
+		ORDER BY scanned_at DESC
+		LIMIT 1`, componentID).Scan(
+		&row.ID, &row.ComponentID, &row.Scanner, &st,
+		&row.Malicious, &row.Critical, &row.High, &row.Medium, &row.Low, &row.Unknown, &row.Total,
+		&row.ScannedAt, &raw, &row.Error,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, repository.ErrNotFound
+		}
+		return nil, err
+	}
+	row.Status = domain.ScanStatus(st)
+	unmarshalJSONB(raw, &row.Raw, "scan_results", row.ID, "raw")
+	return &row, nil
+}
+
+func (r *scanResultRepo) Aggregate(ctx context.Context) (*domain.SecuritySummary, error) {
+	var s domain.SecuritySummary
+	err := lockDB(ctx, r.pool).QueryRow(ctx, `
+		WITH latest AS (
+			SELECT DISTINCT ON (component_id)
+				component_id, malicious, critical, high, medium, low, unknown
+			FROM scan_results
+			ORDER BY component_id, scanned_at DESC
+		)
+		SELECT
+			COALESCE(SUM(malicious),0),
+			COALESCE(SUM(critical),0),
+			COALESCE(SUM(high),0),
+			COALESCE(SUM(medium),0),
+			COALESCE(SUM(low),0),
+			COALESCE(SUM(unknown),0),
+			COUNT(*)
+		FROM latest`).Scan(
+		&s.Malicious, &s.Critical, &s.High, &s.Medium, &s.Low, &s.Unknown, &s.ScannedTotal,
+	)
+	return &s, err
+}
+
+func (r *scanResultRepo) List(ctx context.Context, f domain.VulnFilter) ([]*domain.VulnRow, int, error) {
+	if f.Limit <= 0 {
+		f.Limit = 50
+	}
+
+	// severity → minimum column filter.
+	//
+	// A malicious-package report has no CVSS level, so it cannot be ordered
+	// against the CVE tiers on its own terms — but it is never less urgent than
+	// one, so every minimum-severity tier matches it. Asking for MALICIOUS
+	// specifically is the one filter that does not widen: it means malware, not
+	// "malware and everything above LOW".
+	sevFilter := ""
+	switch f.Severity {
+	case "MALICIOUS":
+		sevFilter = "AND sr.malicious > 0"
+	case "CRITICAL":
+		sevFilter = "AND (sr.malicious > 0 OR sr.critical > 0)"
+	case "HIGH":
+		sevFilter = "AND (sr.malicious > 0 OR sr.critical > 0 OR sr.high > 0)"
+	case "MEDIUM":
+		sevFilter = "AND (sr.malicious > 0 OR sr.critical > 0 OR sr.high > 0 OR sr.medium > 0)"
+	case "LOW":
+		sevFilter = "AND (sr.malicious > 0 OR sr.critical > 0 OR sr.high > 0 OR sr.medium > 0 OR sr.low > 0)"
+	}
+
+	base := `
+		FROM (
+			SELECT DISTINCT ON (sr.component_id)
+				r.name AS repo_name, r.format,
+				c.id AS component_id, c.name, c.version,
+				sr.malicious, sr.critical, sr.high, sr.medium, sr.low, sr.unknown, sr.scanned_at
+			FROM scan_results sr
+			JOIN components c ON c.id = sr.component_id
+			JOIN repositories r ON r.id = c.repository_id
+			WHERE ($1 = '' OR r.name = $1)
+			  AND ($2 = '' OR r.format = $2)
+			  ` + sevFilter + `
+			ORDER BY sr.component_id, sr.scanned_at DESC
+		) t`
+
+	var total int
+	if err := lockDB(ctx, r.pool).QueryRow(ctx, "SELECT COUNT(*) "+base, f.Repo, f.Format).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	rows, err := lockDB(ctx, r.pool).Query(ctx,
+		"SELECT repo_name, format, component_id, name, version, malicious, critical, high, medium, low, unknown, scanned_at"+
+			base+" ORDER BY malicious DESC, critical DESC, high DESC, scanned_at DESC LIMIT $3 OFFSET $4",
+		f.Repo, f.Format, f.Limit, f.Offset,
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var out []*domain.VulnRow
+	for rows.Next() {
+		var vr domain.VulnRow
+		var scannedAt time.Time
+		if err := rows.Scan(&vr.RepoName, &vr.Format, &vr.ComponentID, &vr.Name, &vr.Version,
+			&vr.Malicious, &vr.Critical, &vr.High, &vr.Medium, &vr.Low, &vr.Unknown, &scannedAt); err != nil {
+			return nil, 0, err
+		}
+		vr.ScannedAt = scannedAt
+		out = append(out, &vr)
+	}
+	return out, total, rows.Err()
+}

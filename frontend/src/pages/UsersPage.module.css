@@ -1,0 +1,149 @@
+.page {
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  height: 100%;
+}
+
+.header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.title {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--holo-text);
+  margin: 0 0 4px;
+}
+
+.subtitle {
+  font-size: 13px;
+  color: var(--holo-text-dim);
+  margin: 0;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.toolbar {
+  display: flex;
+  gap: 12px;
+}
+
+.table {
+  background: rgba(var(--holo-ink-rgb), 0.02);
+  border: 1px solid var(--holo-border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.tableHead {
+  display: grid;
+  grid-template-columns: 160px 140px 200px 1fr 90px 80px 44px;
+  padding: 10px 16px;
+  background: rgba(var(--holo-ink-rgb), 0.03);
+  border-bottom: 1px solid var(--holo-border);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--holo-text-faint);
+}
+
+.tableRow {
+  display: grid;
+  grid-template-columns: 160px 140px 200px 1fr 90px 80px 44px;
+  padding: 12px 16px;
+  border-bottom: 1px solid rgba(var(--holo-ink-rgb), 0.04);
+  align-items: center;
+  transition: background 0.1s;
+}
+
+.tableRow:last-child { border-bottom: none; }
+.tableRow:hover { background: rgba(124,92,255,0.04); }
+
+.username {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--holo-text);
+}
+
+.userIcon {
+  opacity: 0.4;
+  flex-shrink: 0;
+}
+
+.cell {
+  font-size: 13px;
+  color: var(--holo-text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.roles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+.empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--holo-text-faint);
+  font-size: 14px;
+  padding: 60px 0;
+}
+
+.emptyIcon { opacity: 0.3; }
+
+/* CreateUserModal form layout */
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.formGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+.formRow {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--holo-text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.error {
+  background: rgba(255,107,107,0.08);
+  border: 1px solid rgba(255,107,107,0.2);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: var(--holo-red);
+  font-size: 13px;
+}

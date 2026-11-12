@@ -1,0 +1,204 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.26.10'
+          cache: true
+      - name: Install golangci-lint (pinned, via Go proxy)
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+      - name: Run golangci-lint
+        run: golangci-lint run ./...
+
+  helm:
+    name: helm chart (env names map to config keys)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
+      - name: helm lint
+        run: helm lint deploy/helm/nexspence
+      - name: Render every configuration
+        run: |
+          set -euo pipefail
+          helm template check deploy/helm/nexspence >/dev/null
+          helm template check deploy/helm/nexspence --set scanning.enabled=true >/dev/null
+          helm template check deploy/helm/nexspence --set scanning.enabled=true --set scanning.dbRepository={ghcr.io/aquasecurity/trivy-db:2} --set scanning.javaDbRepository={ghcr.io/aquasecurity/trivy-java-db:1} >/dev/null
+          helm template check deploy/helm/nexspence --set storage.type=s3 --set storage.s3.bucket=b >/dev/null
+          helm template check deploy/helm/nexspence --set storage.type=s3 --set storage.s3.bucket=b --set storage.s3.accessKey=k --set storage.s3.secretKey=s >/dev/null
+          helm template check deploy/helm/nexspence --set storage.type=azure --set storage.azure.container=c --set storage.azure.accountName=acct >/dev/null
+          helm template check deploy/helm/nexspence --set config.docker.subdomainConnector.enabled=true >/dev/null
+          helm template check deploy/helm/nexspence --set config.adminExistingSecret=ext --set config.jwtSecretExistingSecret=ext >/dev/null
+          helm template check deploy/helm/nexspence --set oidc.enabled=true --set oidc.cookieKeyExistingSecret=ext >/dev/null
+          helm template check deploy/helm/nexspence --set gateway.istio.enabled=true --set gateway.istio.existingGateway=istio-system/gw >/dev/null
+      - name: Deployment / StatefulSet workloads render as intended
+        run: python3 scripts/test-helm-workload.py
+      - name: Bootstrap off must not ship admin credentials
+        run: |
+          set -euo pipefail
+          if helm template check deploy/helm/nexspence --set config.bootstrapEnabled=false \
+            | grep -E 'NEXSPENCE_BOOTSTRAP_ADMIN_(PASSWORD|USERNAME)'; then
+            echo "bootstrap is off, yet the chart still ships admin credentials" >&2
+            exit 1
+          fi
+      # An env name that matches no config key is silently ignored by viper, so
+      # the value in values.yaml never reaches the server and nothing says so.
+      # That has happened three times; this is the guard.
+      - name: Chart env names must match config keys
+        run: python3 scripts/check-helm-env.py
+      # A value in values.yaml that never reaches the server is the same class
+      # of bug as an env name that matches no key: the install runs on defaults
+      # while the values file plainly says otherwise.
+      - name: Chart exposes the rate limit and extraEnv
+        run: python3 scripts/test-helm-config.py
+
+  frontend:
+    name: frontend tests (≥80% coverage)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Type-check production build
+        run: npm run build
+      - name: Type-check test files
+        run: npm run typecheck:test
+      - name: Run tests with coverage (≥80% threshold)
+        run: npm run test:coverage
+
+  coverage:
+    name: unit test coverage (per-package ≥80%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.26.10'
+          cache: true
+      - name: Enforce per-package ≥80% floor
+        run: |
+          # Packages explicitly excluded from the ≥80% unit-test floor.
+          # Each exclusion is a Python regex matched against the full package path.
+          # Reasons:
+          #   internal/db$           — goose migration runner, no testable business logic
+          #   internal/logger$       — thin zap wrapper, no logic
+          #   internal/config$       — viper config struct, no logic
+          #   internal/api$          — gin router wiring; middleware is tested via
+          #                            internal/api/handlers/* and internal/api/*_test.go
+          #   internal/audit$        — partition-rotation goroutine requires live Postgres
+          #   internal/auth$         — LDAP bind path requires a live server; JWT/bcrypt
+          #                            unit coverage deferred to a follow-up track
+          #   internal/metrics$      — StartSampler/takeSample require live pgxpool
+          #   internal/storage$      — tested via integration-tagged MinIO tests
+          #   internal/repository/postgres$ — tested via integration-tagged dockertest
+          #   internal/testutil$     — test helpers, not production code
+          #   internal/formats$      — top-level formats package has no Go files
+          #   cmd/                   — entrypoint wiring
+          python3 - <<'PYEOF'
+          import subprocess, re, sys
+
+          EXCLUDED = [
+              r"internal/db$",
+              r"internal/logger$",
+              r"internal/config$",
+              r"internal/api$",
+              r"internal/audit$",
+              r"internal/auth$",
+              r"internal/metrics$",
+              r"internal/storage$",
+              r"internal/repository/postgres$",
+              r"internal/testutil$",
+              r"internal/formats$",
+              r"cmd/",
+          ]
+
+          result = subprocess.run(
+              ["go", "test", "-count=1", "-cover", "./internal/...", "./cmd/..."],
+              capture_output=True, text=True
+          )
+          fail = 0
+          for line in result.stdout.splitlines():
+              if not line.startswith("ok"):
+                  continue
+              parts = line.split()
+              pkg = parts[1]
+              m = re.search(r"coverage: ([0-9.]+)%", line)
+              if not m:
+                  continue
+              pct = float(m.group(1))
+              short = pkg.split("/nexspence/")[-1]
+
+              if any(re.search(ex, short) for ex in EXCLUDED):
+                  print(f"  skip  {short}: {pct:.1f}%")
+                  continue
+
+              if pct >= 80.0:
+                  print(f"  ok    {short}: {pct:.1f}%")
+              else:
+                  print(f"::error::{pkg} coverage {pct:.1f}% is below the 80% floor")
+                  fail = 1
+
+          sys.exit(fail)
+          PYEOF
+
+  integration:
+    name: integration tests (postgres + storage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.26.10'
+          cache: true
+      - name: Run postgres integration tests with coverage
+        run: |
+          go test -tags=integration -count=1 \
+            -coverpkg=./internal/repository/postgres/... \
+            -coverprofile=pg_cov.out \
+            ./internal/repository/postgres/...
+      - name: Enforce postgres package ≥80%
+        run: |
+          pct=$(go tool cover -func=pg_cov.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          echo "postgres coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit (p+0 >= 80) ? 0 : 1 }' || {
+            echo "::error::postgres repository coverage ${pct}% is below the 80% floor"; exit 1; }
+      - name: Run storage integration tests (MinIO via dockertest)
+        run: |
+          go test -tags=integration -count=1 \
+            -coverpkg=./internal/storage/... \
+            -coverprofile=storage_cov.out \
+            ./internal/storage/...
+      - name: Run end-to-end integration tests (full router + real-shape registry fakes)
+        run: |
+          go test -tags=integration -count=1 ./internal/integration/...
+      - name: Enforce storage package ≥80%
+        run: |
+          pct=$(go tool cover -func=storage_cov.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          echo "storage coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit (p+0 >= 80) ? 0 : 1 }' || {
+            echo "::error::storage coverage ${pct}% is below the 80% floor"; exit 1; }

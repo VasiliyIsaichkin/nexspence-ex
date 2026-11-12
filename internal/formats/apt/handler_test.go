@@ -1,0 +1,270 @@
+package apt_test
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/formats"
+	"github.com/nexspence-oss/nexspence/internal/formats/apt"
+	"github.com/nexspence-oss/nexspence/internal/testutil"
+)
+
+func init() { gin.SetMode(gin.TestMode) }
+
+func setup(repo *domain.Repository) *gin.Engine {
+	d := formats.Deps{
+		Repos:      testutil.NewRepoRepo(repo),
+		Blobs:      testutil.NewBlobStoreRepo(),
+		Components: testutil.NewComponentRepo(),
+		Assets:     testutil.NewAssetRepo(),
+		BlobStore:  testutil.NewBlobStore(),
+		BaseURL:    "http://localhost:8080",
+	}
+	h := apt.New(d)
+	r := gin.New()
+	r.Any("/repository/:repoName/*path", func(c *gin.Context) { h.ServeHTTP(c) })
+	return r
+}
+
+func putDeb(r *gin.Engine, repoName, path, content string) int {
+	req := httptest.NewRequest(http.MethodPut, "/repository/"+repoName+path,
+		strings.NewReader(content))
+	req.ContentLength = int64(len(content))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w.Code
+}
+
+func TestApt_UploadAndDownload(t *testing.T) {
+	repo := testutil.SimpleRepo("debs", "apt")
+	r := setup(repo)
+
+	require.Equal(t, http.StatusCreated,
+		putDeb(r, "debs", "/pool/main/nginx_1.25.0_amd64.deb", "deb-bytes"))
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/repository/debs/pool/main/nginx_1.25.0_amd64.deb", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "deb-bytes", w.Body.String())
+}
+
+func TestApt_RootUpload_NormalizesToPool(t *testing.T) {
+	// Regression for #46: `curl --upload-file foo.deb .../repository/<repo>/`
+	// PUTs a .deb to the repository root, which previously returned 405.
+	repo := testutil.SimpleRepo("debs-root", "apt")
+	r := setup(repo)
+
+	require.Equal(t, http.StatusCreated,
+		putDeb(r, "debs-root", "/docker-ce_5.0_amd64.deb", "docker-bytes"))
+
+	// Stored under the canonical pool layout, so it downloads and indexes.
+	req := httptest.NewRequest(http.MethodGet,
+		"/repository/debs-root/pool/main/d/docker-ce/docker-ce_5.0_amd64.deb", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "docker-bytes", w.Body.String())
+
+	req = httptest.NewRequest(http.MethodGet,
+		"/repository/debs-root/dists/focal/main/binary-amd64/Packages", nil)
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "docker-ce")
+}
+
+func TestApt_Release(t *testing.T) {
+	repo := testutil.SimpleRepo("debs2", "apt")
+	r := setup(repo)
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/repository/debs2/dists/focal/Release", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "focal")
+	assert.Contains(t, w.Body.String(), "Nexspence")
+}
+
+func TestApt_PackagesIndex_Empty(t *testing.T) {
+	repo := testutil.SimpleRepo("debs3", "apt")
+	r := setup(repo)
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/repository/debs3/dists/focal/main/binary-amd64/Packages", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "", w.Body.String())
+}
+
+func TestApt_PackagesIndex_ShowsPackage(t *testing.T) {
+	repo := testutil.SimpleRepo("debs4", "apt")
+	r := setup(repo)
+
+	require.Equal(t, http.StatusCreated,
+		putDeb(r, "debs4", "/pool/main/curl_8.0.0_amd64.deb", "curl-bytes"))
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/repository/debs4/dists/focal/main/binary-amd64/Packages", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "curl")
+}
+
+func TestApt_Delete(t *testing.T) {
+	repo := testutil.SimpleRepo("debs5", "apt")
+	r := setup(repo)
+
+	require.Equal(t, http.StatusCreated,
+		putDeb(r, "debs5", "/pool/main/vim_9.0_amd64.deb", "vim-bytes"))
+
+	req := httptest.NewRequest(http.MethodDelete,
+		"/repository/debs5/pool/main/vim_9.0_amd64.deb", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNoContent, w.Code)
+}
+
+func TestApt_GetNotFound(t *testing.T) {
+	repo := testutil.SimpleRepo("debs6", "apt")
+	r := setup(repo)
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/repository/debs6/pool/main/missing_1.0_amd64.deb", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestApt_ProxyRejectMutation(t *testing.T) {
+	repo := testutil.SimpleRepo("debs7", "apt")
+	repo.Type = domain.TypeProxy
+
+	r := setup(repo)
+	code := putDeb(r, "debs7", "/pool/main/pkg_1.0_amd64.deb", "data")
+	assert.Equal(t, http.StatusMethodNotAllowed, code)
+}
+
+// postDeb uploads a .deb via POST to an explicit path (body = raw deb bytes).
+func postDeb(r *gin.Engine, repoName, path, content string) int {
+	req := httptest.NewRequest(http.MethodPost, "/repository/"+repoName+path,
+		strings.NewReader(content))
+	req.Header.Set("Content-Type", "application/vnd.debian.binary-package")
+	req.ContentLength = int64(len(content))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w.Code
+}
+
+// postDebMultipart uploads a .deb via Nexus-style POST to the repo root
+// (multipart/form-data with a "file" field carrying the filename).
+func postDebMultipart(r *gin.Engine, repoName, filename, content string) int {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, _ := mw.CreateFormFile("file", filename)
+	_, _ = part.Write([]byte(content))
+	_ = mw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/repository/"+repoName+"/", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w.Code
+}
+
+func TestApt_PostDebPath_Upload(t *testing.T) {
+	// Regression for #96: Nexus-compatible clients publish .deb files via
+	// POST, which previously fell through to the default 405 branch.
+	repo := testutil.SimpleRepo("debs-post", "apt")
+	r := setup(repo)
+
+	require.Equal(t, http.StatusCreated,
+		postDeb(r, "debs-post", "/nginx_1.25.0_amd64.deb", "deb-bytes"))
+
+	// Root-level uploads normalize into the pool layout (same as PUT, #46).
+	req := httptest.NewRequest(http.MethodGet,
+		"/repository/debs-post/pool/main/n/nginx/nginx_1.25.0_amd64.deb", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "deb-bytes", w.Body.String())
+}
+
+func TestApt_PostRootMultipart_Upload(t *testing.T) {
+	repo := testutil.SimpleRepo("debs-mp", "apt")
+	r := setup(repo)
+
+	require.Equal(t, http.StatusCreated,
+		postDebMultipart(r, "debs-mp", "curl_8.5.0_amd64.deb", "curl-bytes"))
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/repository/debs-mp/pool/main/c/curl/curl_8.5.0_amd64.deb", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "curl-bytes", w.Body.String())
+}
+
+// ── #443: index scope and size ───────────────────────────────────────────────
+
+func TestApt_PackagesIndex_IgnoresDebsOutsidePool(t *testing.T) {
+	// Uploads are always normalised into /pool/, but an asset can still land
+	// elsewhere (restore, migration, a raw import). apt fetches Filename
+	// relative to the repo root, so only /pool/ debs belong in the index.
+	repo := testutil.SimpleRepo("debs-scope", "apt")
+	comps := testutil.NewComponentRepo()
+	assets := testutil.NewAssetRepo()
+	d := formats.Deps{
+		Repos: testutil.NewRepoRepo(repo), Blobs: testutil.NewBlobStoreRepo(),
+		Components: comps, Assets: assets, BlobStore: testutil.NewBlobStore(),
+		BaseURL: "http://localhost:8080",
+	}
+	h := apt.New(d)
+	r := gin.New()
+	r.Any("/repository/:repoName/*path", func(c *gin.Context) { h.ServeHTTP(c) })
+	require.Equal(t, http.StatusCreated, putDeb(r, "debs-scope", "/pool/main/good_1.0_amd64.deb", "a"))
+
+	stray := &domain.Component{Repository: "debs-scope", Name: "stray", Version: "1.0", Format: "apt"}
+	require.NoError(t, comps.Create(context.Background(), stray))
+	require.NoError(t, assets.Create(context.Background(), &domain.Asset{
+		Repository: "debs-scope", ComponentID: stray.ID, Path: "/foo/stray_1.0_amd64.deb", SizeBytes: 1,
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/repository/debs-scope/dists/focal/main/binary-amd64/Packages", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "Package: good\n")
+	assert.NotContains(t, w.Body.String(), "Package: stray\n")
+}
+
+func TestApt_PackagesIndex_ListsMoreThanOnePage(t *testing.T) {
+	repo := testutil.SimpleRepo("debs-big", "apt")
+	r := setup(repo)
+	const n = 1203
+	for i := 0; i < n; i++ {
+		require.Equal(t, http.StatusCreated,
+			putDeb(r, "debs-big", fmt.Sprintf("/pool/main/pkg%04d_1.0_amd64.deb", i), "x"))
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/repository/debs-big/dists/focal/main/binary-amd64/Packages", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, n, strings.Count(w.Body.String(), "Package: "))
+}

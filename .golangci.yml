@@ -1,0 +1,87 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+issues:
+  max-same-issues: 0
+  max-issues-per-linter: 0
+
+linters:
+  default: standard
+  enable:
+    # error-handling (Phase 2)
+    - errorlint
+    - nilnil
+    - bodyclose
+    - sqlclosecheck
+    - rowserrcheck
+    - nilerr
+    # style / security (Phase 3)
+    - revive
+    - gocritic
+    - gosec
+    - misspell
+    - unconvert
+    - nakedret
+    - gocyclo
+    - whitespace
+    - usestdlibvars
+  settings:
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+    gocyclo:
+      min-complexity: 30
+    nakedret:
+      max-func-lines: 30
+    misspell:
+      locale: US
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: increment-decrement
+        - name: var-declaration
+        - name: indent-error-flow
+        - name: superfluous-else
+        - name: unreachable-code
+        - name: redefines-builtin-id
+        - name: unused-parameter
+        - name: exported
+          arguments:
+            - disableStutteringCheck
+  exclusions:
+    generated: lax
+    paths:
+      - frontend/node_modules
+      - bin
+      - third_party$
+      - builtin$
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - gocyclo
+          - revive
+          - nilnil
+      # Mocks are test scaffolding — exempt from the exported doc-comment rule.
+      - path: internal/testutil/mocks\.go
+        linters:
+          - revive
+        text: "exported:"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/nexspence-oss/nexspence

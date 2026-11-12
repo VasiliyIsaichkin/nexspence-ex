@@ -1,0 +1,477 @@
+package repoproxy
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/net/http/httpproxy"
+	xproxy "golang.org/x/net/proxy"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/netguard"
+)
+
+// Timeouts/limits mirror the shared UpstreamClient so proxied clients behave
+// equivalently (redirect cap, response-header timeout, idle-conn tuning).
+// proxyRequestTimeout bounds connect + wait-for-headers only (Transport.
+// ResponseHeaderTimeout) — not the whole call, so it does not cap how long a
+// large artifact's body may take to stream once the upstream has started
+// answering. The body itself is bounded by idleGuardedTransport instead,
+// wrapped around the transport built below. See UpstreamClient's doc comment
+// in repoproxy.go for why.
+const (
+	proxyDialTimeout    = 10 * time.Second
+	proxyRequestTimeout = 5 * time.Minute
+	proxyMaxIdleConns   = 128
+	proxyIdleConnTO     = 90 * time.Second
+	proxyTLSHandshakeTO = 15 * time.Second
+	proxyMaxRedirects   = 12
+)
+
+// proxySettings is the resolved outbound-proxy configuration for a repository.
+// The zero value means "no explicit proxy" (fall back to the shared,
+// SSRF-guarded UpstreamClient which honors HTTP(S)_PROXY/NO_PROXY env vars).
+type proxySettings struct {
+	httpProxy   string
+	httpsProxy  string
+	socks5Proxy string
+	noProxy     string
+	username    string
+	password    string
+}
+
+func (s proxySettings) isEmpty() bool { return s == proxySettings{} }
+
+// key is a stable cache key for a settings value.
+func (s proxySettings) key() string {
+	return strings.Join([]string{
+		s.httpProxy, s.httpsProxy, s.socks5Proxy, s.noProxy, s.username, s.password,
+	}, "\x00")
+}
+
+// defaultProxySettings, if non-empty, is the server-wide outbound proxy applied
+// to every proxy repository that does not set its own proxy_config overrides.
+// It is optional: when empty, the shared UpstreamClient (which honors the
+// standard HTTP_PROXY/HTTPS_PROXY/NO_PROXY env vars) is used for the no-override
+// case. Guard it with defaultProxyMu.
+var (
+	defaultProxySettings proxySettings
+	defaultProxyMu       sync.RWMutex
+)
+
+// SetGlobalProxy installs a server-wide outbound proxy default. Per-repository
+// proxy_config keys still override individual fields. Pass all-empty strings to
+// clear it and fall back to env-based defaults. Intended to be called once from
+// server config loading at startup.
+func SetGlobalProxy(httpProxy, httpsProxy, socks5Proxy, noProxy, username, password string) {
+	defaultProxyMu.Lock()
+	defer defaultProxyMu.Unlock()
+	defaultProxySettings = proxySettings{
+		httpProxy:   strings.TrimSpace(httpProxy),
+		httpsProxy:  strings.TrimSpace(httpsProxy),
+		socks5Proxy: strings.TrimSpace(socks5Proxy),
+		noProxy:     strings.TrimSpace(noProxy),
+		username:    username,
+		password:    password,
+	}
+}
+
+func cfgString(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	if raw, ok := m[key]; ok {
+		if s, ok := raw.(string); ok {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
+}
+
+// repoProxySettings resolves the effective proxy settings for a repo: the
+// server-wide default overlaid with any per-repo proxy_config overrides.
+func repoProxySettings(repo *domain.Repository) proxySettings {
+	defaultProxyMu.RLock()
+	s := defaultProxySettings
+	defaultProxyMu.RUnlock()
+
+	pc := repo.ProxyConfig
+	if v := cfgString(pc, "http_proxy"); v != "" {
+		s.httpProxy = v
+	}
+	if v := cfgString(pc, "https_proxy"); v != "" {
+		s.httpsProxy = v
+	}
+	if v := cfgString(pc, "socks5_proxy"); v != "" {
+		s.socks5Proxy = v
+	}
+	if v := cfgString(pc, "no_proxy"); v != "" {
+		s.noProxy = v
+	}
+	if v := cfgString(pc, "proxy_username"); v != "" {
+		s.username = v
+	}
+	if v := cfgString(pc, "proxy_password"); v != "" {
+		s.password = v
+	}
+	return s
+}
+
+var (
+	clientCache   = map[string]*http.Client{}
+	clientCacheMu sync.Mutex
+)
+
+// ClientFor returns the *http.Client to use for outbound upstream fetches for
+// repo. When the repo (and the server-wide default) specify no explicit proxy,
+// it returns the shared, SSRF-guarded UpstreamClient — preserving existing
+// behavior and keeping the guard active for direct upstream dials. When an
+// outbound proxy IS configured, it returns a per-config cached client whose
+// TCP connections go to the (admin-configured, trusted) proxy.
+//
+// SSRF-guard interaction: the guard exists because remote_url is
+// user-configured and must not be able to reach internal addresses on a DIRECT
+// dial. When a proxy is configured, the only address the process dials for the
+// request itself is the proxy — the user-controlled upstream host is resolved
+// by the proxy, not by us. The dial to the proxy is therefore not guarded (an
+// explicitly-configured internal proxy stays reachable), while a direct dial —
+// which is what `no_proxy` asks for — still goes through the guard, because
+// that dial reaches the user-configured upstream.
+func ClientFor(repo *domain.Repository) *http.Client {
+	if repo == nil {
+		return UpstreamClient
+	}
+	s := repoProxySettings(repo)
+	if s.isEmpty() {
+		return UpstreamClient
+	}
+
+	k := s.key()
+	clientCacheMu.Lock()
+	if c, ok := clientCache[k]; ok {
+		clientCacheMu.Unlock()
+		return c
+	}
+	clientCacheMu.Unlock()
+
+	c, err := buildProxyClient(s)
+	if err != nil {
+		// Misconfiguration: fall back to the guarded default rather than
+		// silently disabling outbound fetches.
+		return UpstreamClient
+	}
+
+	clientCacheMu.Lock()
+	// Re-check in case of a concurrent build.
+	if existing, ok := clientCache[k]; ok {
+		clientCacheMu.Unlock()
+		return existing
+	}
+	clientCache[k] = c
+	clientCacheMu.Unlock()
+	return c
+}
+
+func redirectPolicy(_ *http.Request, via []*http.Request) error {
+	if len(via) >= proxyMaxRedirects {
+		return fmt.Errorf("stopped after %d redirects", proxyMaxRedirects)
+	}
+	return nil
+}
+
+// proxyDialAddrs are the addresses the transport dials for the proxy itself,
+// in the form net/http hands them to the dialer: host:port, with the
+// scheme's default port when the proxy URL carries none.
+func (s proxySettings) proxyDialAddrs() map[string]bool {
+	out := map[string]bool{}
+	add := func(host, port string) {
+		if host == "" {
+			return
+		}
+		out[strings.ToLower(net.JoinHostPort(host, port))] = true
+	}
+	for _, raw := range []string{s.httpProxy, s.httpsProxy} {
+		if raw == "" {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			continue
+		}
+		port := u.Port()
+		if port == "" {
+			switch u.Scheme {
+			case "https":
+				port = "443"
+			default:
+				port = "80"
+			}
+		}
+		add(u.Hostname(), port)
+	}
+	if s.socks5Proxy != "" {
+		if hp, err := hostPort(s.socks5Proxy); err == nil {
+			out[strings.ToLower(hp)] = true
+		}
+	}
+	return out
+}
+
+// buildProxyClient constructs an *http.Client that routes outbound requests
+// through the configured proxy. SOCKS5 takes precedence over HTTP(S) proxy when
+// both are set.
+//
+// SSRF guard: the proxy is admin-configured and is frequently on an internal
+// IP, so the dial to it is not guarded. Every other dial is a direct one —
+// that is what `no_proxy` asks for — and it reaches the user-configured
+// upstream, so it goes through the guard like any other direct dial. The
+// dialer tells the two apart by address: the transport hands it the proxy's
+// own host:port when it routes through the proxy, and the upstream's
+// host:port when it dials directly.
+func buildProxyClient(s proxySettings) (*http.Client, error) {
+	// Dialer that connects to the proxy. No netguard.Control: the proxy is
+	// trusted/admin-configured and is frequently on an internal IP.
+	baseDialer := &net.Dialer{Timeout: proxyDialTimeout}
+	// Dialer for a direct connection to an upstream: guarded, because the
+	// upstream is user-configured.
+	directDialer := &net.Dialer{Timeout: proxyDialTimeout, Control: netguard.DialControl}
+	proxyAddrs := s.proxyDialAddrs()
+	dialUpstream := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if proxyAddrs[strings.ToLower(addr)] {
+			return baseDialer.DialContext(ctx, network, addr)
+		}
+		return directDialer.DialContext(ctx, network, addr)
+	}
+
+	tr := &http.Transport{
+		MaxIdleConns:        proxyMaxIdleConns,
+		IdleConnTimeout:     proxyIdleConnTO,
+		TLSHandshakeTimeout: proxyTLSHandshakeTO,
+		// Bounds connect + wait-for-headers only, matching UpstreamClient (see
+		// its doc comment) — not the whole call, which would cap a large
+		// artifact's total transfer time regardless of how the fetch is
+		// actually going. The body itself is bounded by idleGuardedTransport
+		// instead, wrapped around this transport below.
+		ResponseHeaderTimeout: proxyRequestTimeout,
+	}
+
+	if s.socks5Proxy != "" {
+		addr, err := hostPort(s.socks5Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("invalid socks5_proxy: %w", err)
+		}
+		var auth *xproxy.Auth
+		if s.username != "" || s.password != "" {
+			auth = &xproxy.Auth{User: s.username, Password: s.password}
+		}
+		d, err := xproxy.SOCKS5("tcp", addr, auth, baseDialer)
+		if err != nil {
+			return nil, fmt.Errorf("build socks5 dialer: %w", err)
+		}
+		cd, ok := d.(xproxy.ContextDialer)
+		if !ok {
+			return nil, fmt.Errorf("socks5 dialer does not support DialContext")
+		}
+		tr.DialContext = cd.DialContext
+		// tr.Proxy stays nil: routing is done at the socket layer.
+	} else {
+		tr.DialContext = dialUpstream
+		pf, err := httpProxyFunc(s)
+		if err != nil {
+			return nil, err
+		}
+		tr.Proxy = pf
+	}
+
+	return &http.Client{
+		Transport:     idleGuardedTransport{Transport: tr, idle: idleBodyTimeout},
+		CheckRedirect: redirectPolicy,
+	}, nil
+}
+
+// httpProxyFunc builds a per-request proxy resolver honoring http_proxy,
+// https_proxy and no_proxy, injecting optional basic-auth credentials.
+func httpProxyFunc(s proxySettings) (func(*http.Request) (*url.URL, error), error) {
+	cfg := &httpproxy.Config{
+		HTTPProxy:  s.httpProxy,
+		HTTPSProxy: s.httpsProxy,
+		NoProxy:    s.noProxy,
+	}
+	resolve := cfg.ProxyFunc()
+	return func(req *http.Request) (*url.URL, error) {
+		u, err := resolve(req.URL)
+		if err != nil || u == nil {
+			return u, err
+		}
+		if u.User == nil && (s.username != "" || s.password != "") {
+			u.User = url.UserPassword(s.username, s.password)
+		}
+		return u, nil
+	}, nil
+}
+
+// hostPort normalizes a proxy address that may be given as "host:port",
+// "scheme://host:port", or "socks5://host:port" into "host:port".
+func hostPort(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return "", err
+		}
+		if u.Host == "" {
+			return "", fmt.Errorf("no host in %q", raw)
+		}
+		return u.Host, nil
+	}
+	if _, _, err := net.SplitHostPort(raw); err != nil {
+		return "", fmt.Errorf("expected host:port, got %q", raw)
+	}
+	return raw, nil
+}
+
+// SetUpstreamAuth adds the repository's upstream HTTP Basic credentials
+// (proxy_config.remote_username / remote_password) to an outbound request, for
+// private upstreams that gate downloads behind Basic auth — a private Maven
+// registry, Mapbox, a corporate npm mirror (#281). Distinct from
+// proxy_username/proxy_password, which authenticate to the outbound forward
+// proxy on the way, not to the registry itself.
+//
+// Credentials stay on remote_url's host, plus any extra base registered with
+// WithTrustedAuthBases (Cargo config.json "dl", which came from remote_url).
+// The OCI Bearer token request goes through here too, so a token realm the
+// registry names on its own host gets Basic and one on any other host does not.
+// Helm (and any other format that fetches an absolute origin URL) can point
+// ServeGET at GitHub releases or a sibling subtree; those hosts must not see
+// remote_username. A request that already carries an Authorization header
+// keeps it — the retry after a Bearer challenge, for one, sets its own token
+// and must win.
+//
+// An http request never receives credentials when remote_url is https, and a
+// trusted base that is itself https does not authorize an http request to
+// that host. An index can list the same host over http; Basic there is
+// cleartext. A remote_url that is already http still sends credentials.
+func SetUpstreamAuth(req *http.Request, repo *domain.Repository) {
+	if req == nil || repo == nil || req.Header.Get("Authorization") != "" {
+		return
+	}
+	remote, err := RemoteURL(repo)
+	if err != nil {
+		return
+	}
+	// Operator configured TLS: never put the password on a cleartext hop,
+	// including a Cargo config.json "dl" that is itself http.
+	if httpsBaseBlocksHTTP(req.URL, remote) {
+		return
+	}
+	if !requestHostMatchesAny(req.URL, authBasesFor(req, remote)...) {
+		return
+	}
+	user := cfgString(repo.ProxyConfig, "remote_username")
+	if user == "" {
+		return
+	}
+	req.SetBasicAuth(user, cfgString(repo.ProxyConfig, domain.RemotePasswordKey))
+}
+
+type trustedAuthBasesKey struct{}
+
+// WithTrustedAuthBases adds extra URL bases whose hosts may receive
+// remote_username. Cargo passes the registry's own config.json "dl" value,
+// which came from remote_url, not from an untrusted chart URL.
+func WithTrustedAuthBases(ctx context.Context, bases ...string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var extra []string
+	for _, b := range bases {
+		if b != "" {
+			extra = append(extra, b)
+		}
+	}
+	if len(extra) == 0 {
+		return ctx
+	}
+	if prev, ok := ctx.Value(trustedAuthBasesKey{}).([]string); ok {
+		extra = append(append([]string{}, prev...), extra...)
+	}
+	return context.WithValue(ctx, trustedAuthBasesKey{}, extra)
+}
+
+func trustedAuthBases(ctx context.Context) []string {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(trustedAuthBasesKey{}).([]string)
+	return v
+}
+
+func authBasesFor(req *http.Request, remote string) []string {
+	bases := []string{remote}
+	if req != nil {
+		bases = append(bases, trustedAuthBases(req.Context())...)
+	}
+	return bases
+}
+
+// requestHostMatchesAny reports whether req is aimed at one of bases.
+// Default ports are stripped so "host:443" and bare "host" over https match.
+// A base that is https does not match an http request.
+func requestHostMatchesAny(reqURL *url.URL, bases ...string) bool {
+	if reqURL == nil || reqURL.Host == "" {
+		return false
+	}
+	for _, remote := range bases {
+		u, err := url.Parse(remote)
+		if err != nil || u.Host == "" {
+			continue
+		}
+		if httpsBaseBlocksHTTP(reqURL, remote) {
+			continue
+		}
+		if NormalizedHost(reqURL, "") == NormalizedHost(u, "") {
+			return true
+		}
+	}
+	return false
+}
+
+// httpsBaseBlocksHTTP reports a scheme downgrade: the trusted base is https
+// and the outbound request is http. Matching hosts is not enough; Basic on
+// that hop is cleartext.
+func httpsBaseBlocksHTTP(reqURL *url.URL, base string) bool {
+	if reqURL == nil || !strings.EqualFold(reqURL.Scheme, "http") {
+		return false
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Scheme, "https")
+}
+
+// NormalizedHost lowercases u's host and drops the default port for its scheme.
+// fallbackScheme is used when u has no scheme (a protocol-relative reference).
+func NormalizedHost(u *url.URL, fallbackScheme string) string {
+	if u == nil {
+		return ""
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme == "" {
+		scheme = strings.ToLower(fallbackScheme)
+	}
+	host := strings.ToLower(u.Host)
+	switch scheme {
+	case "http":
+		return strings.TrimSuffix(host, ":80")
+	case "https":
+		return strings.TrimSuffix(host, ":443")
+	}
+	return host
+}

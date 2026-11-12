@@ -1,0 +1,171 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/repository"
+)
+
+// blobStoreMigrationRepo persists blob-store migration jobs.
+//
+// Rows are an audit trail, not a live pointer: repository_name is TEXT with
+// no FK to repositories, and source/target store FKs SET NULL on store
+// delete (migration 034). There is deliberately no Delete method — a finished
+// (or abandoned) job outlives both the repository and the stores it named.
+// Pruning that history because a repository is gone would be a mistake, not a
+// missing cleanup.
+type blobStoreMigrationRepo struct {
+	db *pgxpool.Pool
+}
+
+// NewBlobStoreMigrationRepo returns a postgres-backed BlobStoreMigrationRepo.
+func NewBlobStoreMigrationRepo(db *pgxpool.Pool) *blobStoreMigrationRepo {
+	return &blobStoreMigrationRepo{db: db}
+}
+
+// activeMigrationConstraint is the partial unique index that allows only one
+// pending/running migration per repository (migration 027). It is the only real
+// guard on the check-then-insert in BlobStoreMigrationService.Start: without
+// Redis the distributed lock is a no-op, so two simultaneous requests otherwise
+// both pass the pre-check.
+const activeMigrationConstraint = "blob_store_migrations_one_active_per_repo"
+
+func (r *blobStoreMigrationRepo) Create(ctx context.Context, m *domain.BlobStoreMigration) error {
+	// An empty target is only a historical state after the destination store
+	// was deleted (SET NULL). A new job always names a real store.
+	if m.TargetStoreID == "" {
+		return fmt.Errorf("target store id is required")
+	}
+	var sourceID *string
+	if m.SourceStoreID != "" {
+		sourceID = &m.SourceStoreID
+	}
+	err := r.db.QueryRow(ctx, `
+		INSERT INTO blob_store_migrations
+		  (repository_name, source_store_id, target_store_id, status)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, created_at, updated_at`,
+		m.RepositoryName, sourceID, m.TargetStoreID, m.Status,
+	).Scan(&m.ID, &m.CreatedAt, &m.UpdatedAt)
+	if constraint, ok := uniqueViolation(err); ok && constraint == activeMigrationConstraint {
+		return &repository.UniqueViolationError{Field: "repository_name"}
+	}
+	return err
+}
+
+func (r *blobStoreMigrationRepo) Get(ctx context.Context, id string) (*domain.BlobStoreMigration, error) {
+	row := r.db.QueryRow(ctx, `SELECT `+blobStoreMigrationCols+` FROM blob_store_migrations WHERE id = $1`, id)
+	m, err := scanMigration(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, repository.ErrNotFound
+	}
+	return m, err
+}
+
+func (r *blobStoreMigrationRepo) GetActiveByRepo(ctx context.Context, repoName string) (*domain.BlobStoreMigration, error) {
+	row := r.db.QueryRow(ctx, `
+		SELECT `+blobStoreMigrationCols+` FROM blob_store_migrations
+		WHERE repository_name = $1 AND status IN ('pending','running')
+		ORDER BY created_at DESC LIMIT 1`, repoName)
+	m, err := scanMigration(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, repository.ErrNotFound
+	}
+	return m, err
+}
+
+func (r *blobStoreMigrationRepo) GetLatestByRepo(ctx context.Context, repoName string) (*domain.BlobStoreMigration, error) {
+	row := r.db.QueryRow(ctx, `
+		SELECT `+blobStoreMigrationCols+` FROM blob_store_migrations
+		WHERE repository_name = $1
+		ORDER BY created_at DESC LIMIT 1`, repoName)
+	m, err := scanMigration(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, repository.ErrNotFound
+	}
+	return m, err
+}
+
+func (r *blobStoreMigrationRepo) SetTotals(ctx context.Context, id string, totalAssets int, totalBytes int64) error {
+	_, err := r.db.Exec(ctx, `
+		UPDATE blob_store_migrations
+		SET total_assets=$1, total_bytes=$2, updated_at=NOW()
+		WHERE id=$3`, totalAssets, totalBytes, id)
+	return err
+}
+
+func (r *blobStoreMigrationRepo) UpdateProgress(ctx context.Context, id string, doneAssets int, doneBytes int64) error {
+	_, err := r.db.Exec(ctx, `
+		UPDATE blob_store_migrations
+		SET done_assets=$1, done_bytes=$2, updated_at=NOW()
+		WHERE id=$3`, doneAssets, doneBytes, id)
+	return err
+}
+
+func (r *blobStoreMigrationRepo) UpdateStatus(ctx context.Context, id string, status string, errMsg *string) error {
+	now := time.Now()
+	var startedAt *time.Time
+	if status == "running" {
+		startedAt = &now
+	}
+	_, err := r.db.Exec(ctx, `
+		UPDATE blob_store_migrations
+		SET status=$1, error_message=$2, started_at=COALESCE(started_at,$3), updated_at=NOW()
+		WHERE id=$4`, status, errMsg, startedAt, id)
+	return err
+}
+
+func (r *blobStoreMigrationRepo) FinishMigration(ctx context.Context, id string, status string, errMsg *string) error {
+	_, err := r.db.Exec(ctx, `
+		UPDATE blob_store_migrations
+		SET status=$1, error_message=$2, finished_at=NOW(), updated_at=NOW()
+		WHERE id=$3`, status, errMsg, id)
+	return err
+}
+
+func (r *blobStoreMigrationRepo) ListActive(ctx context.Context) ([]domain.BlobStoreMigration, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT `+blobStoreMigrationCols+` FROM blob_store_migrations
+		WHERE status IN ('pending','running')
+		ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ms []domain.BlobStoreMigration
+	for rows.Next() {
+		m, err := scanMigration(rows)
+		if err != nil {
+			return nil, err
+		}
+		ms = append(ms, *m)
+	}
+	return ms, rows.Err()
+}
+
+const blobStoreMigrationCols = `
+	id, repository_name,
+	COALESCE(source_store_id::text,'') as source_store_id,
+	COALESCE(target_store_id::text,'') as target_store_id,
+	status, total_assets, done_assets, total_bytes, done_bytes,
+	error_message, started_at, finished_at, created_at, updated_at`
+
+func scanMigration(row scanner) (*domain.BlobStoreMigration, error) {
+	var m domain.BlobStoreMigration
+	err := row.Scan(
+		&m.ID, &m.RepositoryName, &m.SourceStoreID, &m.TargetStoreID,
+		&m.Status, &m.TotalAssets, &m.DoneAssets, &m.TotalBytes, &m.DoneBytes,
+		&m.ErrorMessage, &m.StartedAt, &m.FinishedAt, &m.CreatedAt, &m.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}

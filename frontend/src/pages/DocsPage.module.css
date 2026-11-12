@@ -1,0 +1,312 @@
+.docsLayout {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.docsNav {
+  overflow-y: auto;
+  padding: 12px 8px;
+  border-right: 1px solid var(--holo-border);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--holo-a) transparent;
+}
+
+.docsNavSection {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--holo-text-faint);
+  padding: 12px 8px 4px;
+}
+
+.docsNavBtn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--holo-text-dim);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+  transition: all 0.15s;
+}
+
+.docsNavBtn:hover {
+  background: rgba(var(--holo-ink-rgb), 0.04);
+  color: var(--holo-text);
+}
+
+.docsNavBtn.active {
+  background: linear-gradient(90deg, rgba(124,92,255,0.18), rgba(34,211,238,0.06));
+  border-color: rgba(124,92,255,0.30);
+  color: var(--holo-text);
+  font-weight: 600;
+}
+
+.docsContent {
+  overflow-y: auto;
+  padding: 28px 36px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--holo-a) transparent;
+}
+
+.sectionHeader {
+  margin-bottom: 28px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--holo-border);
+}
+
+.sectionTitle {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--holo-text);
+  margin: 0 0 8px;
+}
+
+.sectionDesc {
+  font-size: 14px;
+  color: var(--holo-text-dim);
+  margin: 0;
+  line-height: 1.6;
+}
+
+.blockTitle {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--holo-text-dim);
+  margin: 20px 0 8px;
+}
+
+.blockText {
+  font-size: 13px;
+  color: var(--holo-text-dim);
+  margin: 0 0 8px;
+  line-height: 1.6;
+}
+
+.urlBlock {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: rgba(34,211,238,0.05);
+  border: 1px solid rgba(34,211,238,0.18);
+  border-radius: 8px;
+  margin-bottom: 20px;
+}
+
+.urlValue {
+  flex: 1;
+  font-family: 'Geist Mono', 'Fira Code', monospace;
+  font-size: 13px;
+  color: var(--holo-b);
+  word-break: break-all;
+}
+
+.urlCopyBtn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(34,211,238,0.25);
+  background: rgba(34,211,238,0.08);
+  color: var(--holo-b);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+
+.urlCopyBtn:hover {
+  background: rgba(34,211,238,0.15);
+}
+
+.codeLabel {
+  font-size: 12px;
+  color: var(--holo-text-faint);
+  margin: 8px 0 4px;
+}
+
+.divider {
+  border: none;
+  border-top: 1px solid var(--holo-border);
+  margin: 28px 0;
+}
+
+.noteBox {
+  padding: 10px 14px;
+  background: rgba(255,200,87,0.06);
+  border: 1px solid rgba(255,200,87,0.20);
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--holo-amber);
+  margin-bottom: 12px;
+  line-height: 1.5;
+}
+
+.inlineCode {
+  font-family: 'Geist Mono', monospace;
+  background: rgba(124,92,255,0.12);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--holo-a);
+}
+
+/* ─── Guide Steps ─────────────────────────────── */
+.step {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.stepNum {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--holo-a), var(--holo-b));
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.stepBody {
+  flex: 1;
+  min-width: 0;
+}
+
+.stepTitle {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--holo-text);
+  margin: 0 0 4px;
+}
+
+.stepText {
+  font-size: 13px;
+  color: var(--holo-text-dim);
+  line-height: 1.65;
+  margin: 0 0 10px;
+}
+
+/* ─── Screenshots ─────────────────────────────── */
+.screenshotWrap {
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--holo-border);
+  margin-top: 10px;
+  margin-bottom: 4px;
+}
+
+.screenshotImg {
+  width: 100%;
+  display: block;
+}
+
+.screenshotCaption {
+  font-size: 11px;
+  color: var(--holo-text-faint);
+  text-align: center;
+  padding: 5px 0;
+  font-style: italic;
+  background: rgba(var(--holo-ink-rgb), 0.015);
+  border-top: 1px solid var(--holo-border);
+}
+
+.screenshotPlaceholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 18px 20px;
+  background: rgba(124,92,255,0.04);
+  border: 2px dashed rgba(124,92,255,0.25);
+  border-radius: 10px;
+  margin-top: 10px;
+  text-align: center;
+}
+
+.screenshotPlaceholderLabel {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--holo-tx-purple-60);
+}
+
+.screenshotPlaceholderName {
+  font-size: 12px;
+  color: var(--holo-text-faint);
+  font-style: italic;
+}
+
+.screenshotPlaceholderPath {
+  font-family: 'Geist Mono', monospace;
+  font-size: 10px;
+  color: var(--holo-tx-purple-40);
+  background: rgba(124,92,255,0.08);
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+/* ─── Type cards (Hosted / Proxy / Group) ─────── */
+.typeCards {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
+  margin: 10px 0 14px 44px;
+}
+
+.typeCard {
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--holo-border);
+  background: rgba(var(--holo-ink-rgb), 0.02);
+}
+
+.typeCardName {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--holo-text);
+  margin-bottom: 4px;
+}
+
+.typeCardDesc {
+  font-size: 11.5px;
+  color: var(--holo-text-dim);
+  line-height: 1.5;
+}
+
+/* ─── Format brand icons in nav ───────────────── */
+.navBrandIcon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  object-fit: contain;
+  filter: brightness(0.85);
+}
+
+.docsNavBtn.active .navBrandIcon {
+  filter: brightness(1.2);
+}

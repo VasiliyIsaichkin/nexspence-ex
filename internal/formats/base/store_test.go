@@ -1,0 +1,496 @@
+package base_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/formats"
+	"github.com/nexspence-oss/nexspence/internal/formats/base"
+	"github.com/nexspence-oss/nexspence/internal/storage"
+	"github.com/nexspence-oss/nexspence/internal/testutil"
+)
+
+// deps builds a formats.Deps wired with testutil mocks.
+func deps(repo *domain.Repository) (formats.Deps, *testutil.BlobStore, *testutil.ComponentRepo, *testutil.AssetRepo) {
+	repos := testutil.NewRepoRepo(repo)
+	blobs := testutil.NewBlobStoreRepo()
+	comps := testutil.NewComponentRepo()
+	assets := testutil.NewAssetRepo()
+	comps.HasAssets = assets.HasComponent
+	blobStore := testutil.NewBlobStore()
+
+	return formats.Deps{
+		Repos:      repos,
+		Blobs:      blobs,
+		Components: comps,
+		Assets:     assets,
+		BlobStore:  blobStore,
+		BaseURL:    "http://localhost:8080",
+	}, blobStore, comps, assets
+}
+
+// ── BlobKey ───────────────────────────────────────────────────
+
+func TestBlobKey_Deterministic(t *testing.T) {
+	k1 := base.BlobKey("myrepo", "/path/to/file.jar")
+	k2 := base.BlobKey("myrepo", "/path/to/file.jar")
+	assert.Equal(t, k1, k2)
+}
+
+func TestBlobKey_DifferentInputs(t *testing.T) {
+	k1 := base.BlobKey("repo-a", "/file.jar")
+	k2 := base.BlobKey("repo-b", "/file.jar")
+	k3 := base.BlobKey("repo-a", "/other.jar")
+	assert.NotEqual(t, k1, k2)
+	assert.NotEqual(t, k1, k3)
+}
+
+func TestBlobKey_IsHex64(t *testing.T) {
+	k := base.BlobKey("repo", "/artifact.tgz")
+	assert.Len(t, k, 64, "SHA-256 hex should be 64 chars")
+	for _, c := range k {
+		assert.True(t, (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
+			"unexpected char %q in blob key", c)
+	}
+}
+
+func TestBlobKeyByDigest(t *testing.T) {
+	k := base.BlobKeyByDigest("sha256:abc123")
+	assert.Equal(t, "digest/sha256:abc123", k)
+}
+
+// ── StoreArtifact ─────────────────────────────────────────────
+
+func TestStoreArtifact_HappyPath(t *testing.T) {
+	repo := testutil.SimpleRepo("testrepo", "raw")
+	d, blobStore, comps, assets := deps(repo)
+
+	content := "hello world artifact"
+	coords := base.Coords{Group: "/dir", Name: "file.txt", Version: "1.0"}
+
+	result, err := base.StoreArtifact(context.Background(), d,
+		"testrepo", "/dir/file.txt", "text/plain",
+		coords,
+		strings.NewReader(content), int64(len(content)))
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	// Checksums should be non-empty
+	assert.Len(t, result.SHA256, 64)
+	assert.Len(t, result.SHA1, 40)
+	assert.Len(t, result.MD5, 32)
+	assert.Equal(t, int64(len(content)), result.Size)
+
+	// Blob should be in the store
+	key := base.BlobKey("testrepo", "/dir/file.txt")
+	assert.True(t, blobStore.Has(key))
+	stored, err := blobStore.Read(key)
+	require.NoError(t, err)
+	assert.Equal(t, content, stored)
+
+	// Component + asset records should exist
+	compList, _ := comps.List(context.Background(), "", 100, 0)
+	assert.Len(t, compList.Items, 1)
+
+	assetList, _ := assets.List(context.Background(), "", 100, 0)
+	assert.Len(t, assetList.Items, 1)
+}
+
+// Formats that cache proxied files without parsing coordinates (apt, yum, nuget,
+// conan, cargo, gomod) pass empty Coords. Those must not collapse into one
+// nameless component: the browse UI keys rows off the component name, and an
+// empty name made every cached file share a single unusable row (#76).
+func TestRegisterStoredBlob_EmptyCoords_DerivesNameFromPath(t *testing.T) {
+	repo := testutil.SimpleRepo("apt-proxy", "apt")
+	d, _, comps, _ := deps(repo)
+
+	_, err := base.RegisterStoredBlob(context.Background(), d, repo,
+		"/dists/trixie/InRelease", "text/plain", base.Coords{},
+		"blobkey-1", "sha256", "sha1", "md5", 10, "", "")
+	require.NoError(t, err)
+
+	compList, err := comps.List(context.Background(), "apt-proxy", 100, 0)
+	require.NoError(t, err)
+	require.Len(t, compList.Items, 1)
+	assert.Equal(t, "dists/trixie/InRelease", compList.Items[0].Name)
+}
+
+// Two different cached paths must produce two distinct components.
+func TestRegisterStoredBlob_EmptyCoords_DistinctPathsDistinctComponents(t *testing.T) {
+	repo := testutil.SimpleRepo("apt-proxy", "apt")
+	d, _, comps, _ := deps(repo)
+
+	for _, p := range []string{"/dists/trixie/InRelease", "/dists/trixie/Release"} {
+		_, err := base.RegisterStoredBlob(context.Background(), d, repo,
+			p, "text/plain", base.Coords{},
+			"key"+p, "sha256", "sha1", "md5", 10, "", "")
+		require.NoError(t, err)
+	}
+
+	compList, err := comps.List(context.Background(), "apt-proxy", 100, 0)
+	require.NoError(t, err)
+	assert.Len(t, compList.Items, 2, "each cached path is its own component")
+}
+
+// An explicit name still wins — the fallback only fills a gap.
+func TestRegisterStoredBlob_ExplicitCoordsWin(t *testing.T) {
+	repo := testutil.SimpleRepo("npm-proxy", "npm")
+	d, _, comps, _ := deps(repo)
+
+	_, err := base.RegisterStoredBlob(context.Background(), d, repo,
+		"/lodash/-/lodash-4.17.21.tgz", "application/octet-stream",
+		base.Coords{Name: "lodash", Version: "4.17.21"},
+		"blobkey-2", "sha256", "sha1", "md5", 10, "", "")
+	require.NoError(t, err)
+
+	compList, err := comps.List(context.Background(), "npm-proxy", 100, 0)
+	require.NoError(t, err)
+	require.Len(t, compList.Items, 1)
+	assert.Equal(t, "lodash", compList.Items[0].Name)
+	assert.Equal(t, "4.17.21", compList.Items[0].Version)
+}
+
+func TestStoreArtifact_RepoNotFound(t *testing.T) {
+	repo := testutil.SimpleRepo("exists", "raw")
+	d, _, _, _ := deps(repo)
+
+	_, err := base.StoreArtifact(context.Background(), d,
+		"does-not-exist", "/file.txt", "text/plain",
+		base.Coords{Name: "file.txt"},
+		strings.NewReader("data"), -1)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+func TestStoreArtifact_OfflineRepo(t *testing.T) {
+	repo := testutil.SimpleRepo("offline-repo", "raw")
+	repo.Online = false
+	d, _, _, _ := deps(repo)
+
+	_, err := base.StoreArtifact(context.Background(), d,
+		"offline-repo", "/file.txt", "text/plain",
+		base.Coords{Name: "file.txt"},
+		strings.NewReader("data"), -1)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "offline")
+}
+
+// ── FetchArtifact ─────────────────────────────────────────────
+
+func TestFetchArtifact_HappyPath(t *testing.T) {
+	repo := testutil.SimpleRepo("fetchrepo", "raw")
+	d, blobStore, _, _ := deps(repo)
+
+	// Store first
+	content := "artifact content"
+	_, err := base.StoreArtifact(context.Background(), d,
+		"fetchrepo", "/lib/artifact.jar", "application/java-archive",
+		base.Coords{Name: "artifact.jar", Version: "2.0"},
+		strings.NewReader(content), int64(len(content)))
+	require.NoError(t, err)
+
+	// Now fetch
+	rc, asset, err := base.FetchArtifact(context.Background(), d, "fetchrepo", "/lib/artifact.jar")
+	require.NoError(t, err)
+	require.NotNil(t, rc)
+	require.NotNil(t, asset)
+	defer rc.Close()
+
+	assert.Equal(t, "application/java-archive", asset.ContentType)
+	assert.Equal(t, int64(len(content)), asset.SizeBytes)
+
+	// Verify blob was readable
+	_ = blobStore // already asserted via FetchArtifact rc
+}
+
+func TestFetchArtifact_NotFound(t *testing.T) {
+	repo := testutil.SimpleRepo("emptyrepo", "raw")
+	d, _, _, _ := deps(repo)
+
+	_, _, err := base.FetchArtifact(context.Background(), d, "emptyrepo", "/missing.jar")
+	require.Error(t, err)
+}
+
+// ── DeleteArtifact ────────────────────────────────────────────
+
+func TestDeleteArtifact_HappyPath(t *testing.T) {
+	repo := testutil.SimpleRepo("deleterepo", "raw")
+	d, blobStore, _, _ := deps(repo)
+
+	content := "delete me"
+	_, err := base.StoreArtifact(context.Background(), d,
+		"deleterepo", "/to-delete.bin", "application/octet-stream",
+		base.Coords{Name: "to-delete.bin"},
+		strings.NewReader(content), int64(len(content)))
+	require.NoError(t, err)
+
+	key := base.BlobKey("deleterepo", "/to-delete.bin")
+	assert.True(t, blobStore.Has(key))
+
+	err = base.DeleteArtifact(context.Background(), d, "deleterepo", "/to-delete.bin")
+	require.NoError(t, err)
+
+	assert.False(t, blobStore.Has(key))
+}
+
+// An OCI manifest push registers two assets on ONE blob: the tag path and the
+// digest-alias path. Deleting either one — DELETE by the tag cosign signs under,
+// for instance — must not destroy the bytes the other one still points at, or
+// the surviving asset (and the referrers index built from it) advertises content
+// that is gone.
+func TestDeleteArtifact_KeepsBlobWhileAnotherAssetReferencesIt(t *testing.T) {
+	repo := testutil.SimpleRepo("aliasrepo", "oci")
+	d, blobStore, _, _ := deps(repo)
+
+	ctx := context.Background()
+	content := `{"schemaVersion":2}`
+	tagPath := "/manifests/app/1.0"
+	res, err := base.StoreArtifact(ctx, d,
+		"aliasrepo", tagPath, "application/vnd.oci.image.manifest.v1+json",
+		base.Coords{Name: "app", Version: "1.0"},
+		strings.NewReader(content), int64(len(content)))
+	require.NoError(t, err)
+
+	// The digest alias: a second asset record on the SAME blob key.
+	digestPath := "/manifests/app/sha256:" + res.SHA256
+	_, err = base.RegisterStoredBlob(ctx, d, repo,
+		digestPath, "application/vnd.oci.image.manifest.v1+json",
+		base.Coords{Name: "app", Version: "sha256:" + res.SHA256},
+		res.Asset.BlobKey, res.SHA256, res.SHA1, res.MD5, res.Size, "", "")
+	require.NoError(t, err)
+
+	key := base.BlobKey("aliasrepo", tagPath)
+	require.True(t, blobStore.Has(key))
+
+	// Delete by tag: the alias still needs the bytes.
+	require.NoError(t, base.DeleteArtifact(ctx, d, "aliasrepo", tagPath))
+	assert.True(t, blobStore.Has(key), "blob is still referenced by the digest alias")
+
+	rc, asset, err := base.FetchArtifact(ctx, d, "aliasrepo", digestPath)
+	require.NoError(t, err, "the surviving asset must still serve its content")
+	defer func() { _ = rc.Close() }()
+	body, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	assert.Equal(t, content, string(body))
+	assert.Equal(t, res.SHA256, asset.SHA256)
+
+	// The tag itself is gone.
+	_, _, err = base.FetchArtifact(ctx, d, "aliasrepo", tagPath)
+	require.Error(t, err)
+
+	// Delete the last asset on the blob: now the bytes go.
+	require.NoError(t, base.DeleteArtifact(ctx, d, "aliasrepo", digestPath))
+	assert.False(t, blobStore.Has(key), "no asset references the blob any more")
+}
+
+// Two concurrent DeleteArtifact calls on the last two assets sharing one blob
+// key can each see "the sibling still exists" and both skip the physical
+// delete — every row gone, bytes orphaned on disk. The count-then-delete
+// sequence must hold the blob-key lock so one caller is provably last.
+func TestDeleteArtifact_ConcurrentSiblingDeletes_FreeTheBlob(t *testing.T) {
+	repo := testutil.SimpleRepo("racerepo", "oci")
+	d, blobStore, _, assets := deps(repo)
+
+	ctx := context.Background()
+	content := `{"schemaVersion":2}`
+	tagPath := "/manifests/app/1.0"
+	res, err := base.StoreArtifact(ctx, d,
+		"racerepo", tagPath, "application/vnd.oci.image.manifest.v1+json",
+		base.Coords{Name: "app", Version: "1.0"},
+		strings.NewReader(content), int64(len(content)))
+	require.NoError(t, err)
+
+	digestPath := "/manifests/app/sha256:" + res.SHA256
+	_, err = base.RegisterStoredBlob(ctx, d, repo,
+		digestPath, "application/vnd.oci.image.manifest.v1+json",
+		base.Coords{Name: "app", Version: "sha256:" + res.SHA256},
+		res.Asset.BlobKey, res.SHA256, res.SHA1, res.MD5, res.Size, "", "")
+	require.NoError(t, err)
+
+	key := res.Asset.BlobKey
+	require.True(t, blobStore.Has(key))
+
+	// Barrier: hold each caller right after its reference count until both have
+	// counted (or, when the blob-key lock serializes them so both never arrive,
+	// a timeout lets the holder proceed). Interleaved counts are the bug window.
+	var barrierMu sync.Mutex
+	arrivals := 0
+	bothCounted := make(chan struct{})
+	assets.CountByBlobKeyHook = func(blobKey, excludeID string) {
+		barrierMu.Lock()
+		arrivals++
+		if arrivals == 2 {
+			close(bothCounted)
+		}
+		barrierMu.Unlock()
+		select {
+		case <-bothCounted:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
+	var wg sync.WaitGroup
+	for _, p := range []string{tagPath, digestPath} {
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			if err := base.DeleteArtifact(ctx, d, "racerepo", path); err != nil {
+				t.Errorf("DeleteArtifact(%s): %v", path, err)
+			}
+		}(p)
+	}
+	wg.Wait()
+
+	if _, err := assets.GetByPath(ctx, "racerepo", tagPath); err == nil {
+		t.Error("tag asset row survived its delete")
+	}
+	if _, err := assets.GetByPath(ctx, "racerepo", digestPath); err == nil {
+		t.Error("digest asset row survived its delete")
+	}
+	assert.False(t, blobStore.Has(key),
+		"both rows are gone but the bytes were never freed — each deleter saw the other's row and skipped the physical delete")
+}
+
+func TestDeleteArtifact_Idempotent(t *testing.T) {
+	repo := testutil.SimpleRepo("idempotentrepo", "raw")
+	d, _, _, _ := deps(repo)
+
+	// Deleting a non-existent artifact should not error
+	err := base.DeleteArtifact(context.Background(), d, "idempotentrepo", "/nonexistent.bin")
+	assert.NoError(t, err)
+}
+
+// ── Group blob store routing ──────────────────────────────────
+
+func groupBlobStore(id, name, policy string, memberIDs ...string) *domain.BlobStore {
+	ids := make([]interface{}, len(memberIDs))
+	for i, m := range memberIDs {
+		ids[i] = m
+	}
+	return &domain.BlobStore{
+		ID:   id,
+		Name: name,
+		Type: "group",
+		Config: map[string]any{
+			"fill_policy": policy,
+			"member_ids":  ids,
+		},
+	}
+}
+
+func depsWithGroup(repo *domain.Repository, groupStore *domain.BlobStore, memberStores ...*domain.BlobStore) formats.Deps {
+	allStores := append([]*domain.BlobStore{groupStore}, memberStores...)
+	blobs := testutil.NewBlobStoreRepo(allStores...)
+	defaultBS := testutil.NewBlobStore()
+	reg := storage.NewRegistry(defaultBS)
+	return formats.Deps{
+		Repos:      testutil.NewRepoRepo(repo),
+		Blobs:      blobs,
+		Components: testutil.NewComponentRepo(),
+		Assets:     testutil.NewAssetRepo(),
+		BlobStore:  defaultBS,
+		Registry:   reg,
+		BaseURL:    "http://localhost:8080",
+	}
+}
+
+func TestStoreArtifact_GroupStore_AssetBlobStoreIDIsPhysicalMember(t *testing.T) {
+	memberA := &domain.BlobStore{ID: "member-a", Name: "store-a", Type: "local",
+		Config: map[string]any{"path": t.TempDir()}}
+	memberB := &domain.BlobStore{ID: "member-b", Name: "store-b", Type: "local",
+		Config: map[string]any{"path": t.TempDir()}}
+	group := groupBlobStore("group-1", "my-group", "round_robin", "member-a", "member-b")
+
+	bsID := "group-1"
+	repo := &domain.Repository{
+		ID: "repo-1", Name: "testrepo2", Format: "raw", Type: "hosted",
+		Online: true, BlobStoreID: &bsID,
+	}
+
+	d := depsWithGroup(repo, group, memberA, memberB)
+
+	result, err := base.StoreArtifact(context.Background(), d,
+		"testrepo2", "/file.txt", "text/plain",
+		base.Coords{Name: "file.txt"},
+		strings.NewReader("hello"), 5)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	if result.Asset.BlobStoreID == "group-1" {
+		t.Fatal("asset.BlobStoreID must not be the group ID — it must be a physical member ID")
+	}
+	if result.Asset.BlobStoreID != "member-a" && result.Asset.BlobStoreID != "member-b" {
+		t.Errorf("expected member-a or member-b, got %q", result.Asset.BlobStoreID)
+	}
+}
+
+func TestStoreArtifact_GroupStore_RoundRobin_AlternatesMembers(t *testing.T) {
+	memberA := &domain.BlobStore{ID: "rr-member-a", Name: "rr-store-a", Type: "local",
+		Config: map[string]any{"path": t.TempDir()}}
+	memberB := &domain.BlobStore{ID: "rr-member-b", Name: "rr-store-b", Type: "local",
+		Config: map[string]any{"path": t.TempDir()}}
+	group := groupBlobStore("group-rr", "rr-group", "round_robin", "rr-member-a", "rr-member-b")
+
+	bsID := "group-rr"
+	repo := &domain.Repository{
+		ID: "repo-rr", Name: "rr-repo", Format: "raw", Type: "hosted",
+		Online: true, BlobStoreID: &bsID,
+	}
+	d := depsWithGroup(repo, group, memberA, memberB)
+
+	var selected []string
+	for i := 0; i < 4; i++ {
+		path := fmt.Sprintf("/rr-file%d.txt", i)
+		res, err := base.StoreArtifact(context.Background(), d,
+			"rr-repo", path, "text/plain",
+			base.Coords{Name: fmt.Sprintf("file%d.txt", i)},
+			strings.NewReader("data"), 4)
+		require.NoError(t, err)
+		selected = append(selected, res.Asset.BlobStoreID)
+	}
+	if selected[0] == selected[1] {
+		t.Errorf("round-robin should alternate, got same member twice: %v", selected)
+	}
+	if selected[0] != selected[2] || selected[1] != selected[3] {
+		t.Errorf("round-robin pattern broken: %v", selected)
+	}
+}
+
+func TestStoreArtifact_GroupStore_AllMembersFull_ReturnsQuotaExceeded(t *testing.T) {
+	quota := int64(10)
+	memberA := &domain.BlobStore{ID: "full-a", Name: "full-store-a", Type: "local",
+		QuotaBytes: &quota, UsedBytes: 10,
+		Config: map[string]any{"path": t.TempDir()}}
+	memberB := &domain.BlobStore{ID: "full-b", Name: "full-store-b", Type: "local",
+		QuotaBytes: &quota, UsedBytes: 10,
+		Config: map[string]any{"path": t.TempDir()}}
+	group := groupBlobStore("group-full", "full-group", "write_to_first_fill", "full-a", "full-b")
+
+	bsID := "group-full"
+	repo := &domain.Repository{
+		ID: "repo-full", Name: "full-repo", Format: "raw", Type: "hosted",
+		Online: true, BlobStoreID: &bsID,
+	}
+	d := depsWithGroup(repo, group, memberA, memberB)
+
+	_, err := base.StoreArtifact(context.Background(), d,
+		"full-repo", "/file.txt", "text/plain",
+		base.Coords{Name: "file.txt"},
+		strings.NewReader("hello"), 5)
+	if !errors.Is(err, base.ErrQuotaExceeded) {
+		t.Errorf("want ErrQuotaExceeded when all members full, got %v", err)
+	}
+}

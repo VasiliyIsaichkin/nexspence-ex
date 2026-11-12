@@ -1,0 +1,203 @@
+package handlers_test
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/nexspence-oss/nexspence/internal/api/handlers"
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/testutil"
+)
+
+func mountRoles(t *testing.T) (*gin.Engine, *testutil.RoleRepo, *testutil.UserRepo) {
+	t.Helper()
+	roles := testutil.NewRoleRepo()
+	users := testutil.NewUserRepo()
+	h := handlers.NewRoleHandler(roles, users)
+	r := gin.New()
+	r.GET("/service/rest/v1/security/roles", h.List)
+	r.POST("/service/rest/v1/security/roles", h.Create)
+	r.PUT("/service/rest/v1/security/roles/:id", h.Update)
+	r.DELETE("/service/rest/v1/security/roles/:id", h.Delete)
+	r.PUT("/service/rest/v1/security/users/:userId/roles", h.SetUserRoles)
+	return r, roles, users
+}
+
+func TestRoleHandler_List_Empty(t *testing.T) {
+	r, _, _ := mountRoles(t)
+	rec := do(t, r, http.MethodGet, "/service/rest/v1/security/roles", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got []domain.Role
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Empty(t, got)
+}
+
+func TestRoleHandler_Create_Then_List(t *testing.T) {
+	r, _, _ := mountRoles(t)
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/security/roles",
+		map[string]any{"name": "dev", "description": "developers"})
+	require.Equal(t, http.StatusCreated, rec.Code)
+	var created domain.Role
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &created))
+	assert.Equal(t, "dev", created.Name)
+	assert.Equal(t, "default", created.Source)
+
+	rec = do(t, r, http.MethodGet, "/service/rest/v1/security/roles", nil)
+	var got []domain.Role
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Len(t, got, 1)
+}
+
+func TestRoleHandler_Create_BadJSON_400(t *testing.T) {
+	r, _, _ := mountRoles(t)
+	rec := doRaw(t, r, http.MethodPost, "/service/rest/v1/security/roles", []byte(`{not json`))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestRoleHandler_Create_EmptyName_400(t *testing.T) {
+	r, _, _ := mountRoles(t)
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/security/roles",
+		map[string]any{"description": "no name"})
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestRoleHandler_Update(t *testing.T) {
+	r, roles, _ := mountRoles(t)
+	ro := &domain.Role{Name: "ops"}
+	require.NoError(t, roles.Create(testContext(), ro))
+	rec := do(t, r, http.MethodPut, "/service/rest/v1/security/roles/"+ro.ID,
+		map[string]any{"name": "ops2", "description": "renamed"})
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// A body without "privileges" (a rename from a client that edits only name
+// and description) must leave the role's privileges alone instead of
+// emptying them; an explicit list, empty included, still replaces them.
+func TestRoleHandler_Update_WithoutPrivileges_KeepsThem(t *testing.T) {
+	r, roles, _ := mountRoles(t)
+	ro := &domain.Role{Name: "ops"}
+	require.NoError(t, roles.Create(testContext(), ro))
+	require.NoError(t, roles.SetPrivileges(testContext(), ro.ID, []string{"p1", "p2"}))
+
+	rec := do(t, r, http.MethodPut, "/service/rest/v1/security/roles/"+ro.ID,
+		map[string]any{"name": "ops2", "description": "renamed"})
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.ElementsMatch(t, []string{"p1", "p2"}, roles.PrivilegesOf(ro.ID))
+	var got domain.Role
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.ElementsMatch(t, []string{"p1", "p2"}, got.Privileges)
+
+	rec = do(t, r, http.MethodPut, "/service/rest/v1/security/roles/"+ro.ID,
+		map[string]any{"name": "ops2", "privileges": []string{}})
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Empty(t, roles.PrivilegesOf(ro.ID))
+}
+
+func TestRoleHandler_Delete(t *testing.T) {
+	r, roles, _ := mountRoles(t)
+	ro := &domain.Role{Name: "temp"}
+	require.NoError(t, roles.Create(testContext(), ro))
+	rec := do(t, r, http.MethodDelete, "/service/rest/v1/security/roles/"+ro.ID, nil)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+}
+
+func TestRoleHandler_SetUserRoles_UserNotFound_404(t *testing.T) {
+	r, _, _ := mountRoles(t)
+	rec := do(t, r, http.MethodPut, "/service/rest/v1/security/users/ghost/roles",
+		map[string]any{"roleIds": []string{"r1"}})
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestRoleHandler_SetUserRoles_OK(t *testing.T) {
+	r, _, users := mountRoles(t)
+	u := &domain.User{Username: "alice", Email: "alice@test.com"}
+	require.NoError(t, users.Create(testContext(), u))
+	rec := do(t, r, http.MethodPut, "/service/rest/v1/security/users/alice/roles",
+		map[string]any{"roleIds": []string{"r1", "r2"}})
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+}
+
+func TestRoleHandler_Update_BadJSON_400(t *testing.T) {
+	r, _, _ := mountRoles(t)
+	rec := doRaw(t, r, http.MethodPut, "/service/rest/v1/security/roles/any-id", []byte(`{bad`))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestRoleHandler_SetUserRoles_BadJSON_400(t *testing.T) {
+	r, _, _ := mountRoles(t)
+	rec := doRaw(t, r, http.MethodPut, "/service/rest/v1/security/users/someone/roles", []byte(`{bad`))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// ── 500-branch tests ──────────────────────────────────────────────────────────
+
+func TestRoleHandler_List_RepoError_500(t *testing.T) {
+	r, roles, _ := mountRoles(t)
+	roles.Err = errors.New("db down")
+	rec := do(t, r, http.MethodGet, "/service/rest/v1/security/roles", nil)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+func TestRoleHandler_Create_RepoError_500(t *testing.T) {
+	r, roles, _ := mountRoles(t)
+	roles.Err = errors.New("db down")
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/security/roles",
+		map[string]any{"name": "fail"})
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+func TestRoleHandler_Create_SetPrivileges_RepoError_500(t *testing.T) {
+	// Create succeeds but SetPrivileges fails — exercises the SetPrivileges 500 branch.
+	r, roles, _ := mountRoles(t)
+	roles.SetPrivilegesErr = errors.New("privilege store down")
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/security/roles",
+		map[string]any{"name": "withpriv", "privileges": []string{"p1"}})
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+func TestRoleHandler_Update_RepoError_500(t *testing.T) {
+	r, roles, _ := mountRoles(t)
+	roles.Err = errors.New("db down")
+	rec := do(t, r, http.MethodPut, "/service/rest/v1/security/roles/any-id",
+		map[string]any{"name": "ops2"})
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+func TestRoleHandler_Update_SetPrivileges_RepoError_500(t *testing.T) {
+	// Update succeeds but SetPrivileges fails — exercises the second 500 branch in Update.
+	r, roles, _ := mountRoles(t)
+	roles.SetPrivilegesErr = errors.New("privilege store down")
+	rec := do(t, r, http.MethodPut, "/service/rest/v1/security/roles/any-id",
+		map[string]any{"name": "ops2", "privileges": []string{"p1"}})
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+func TestRoleHandler_Delete_RepoError_500(t *testing.T) {
+	r, roles, _ := mountRoles(t)
+	roles.Err = errors.New("db down")
+	rec := do(t, r, http.MethodDelete, "/service/rest/v1/security/roles/any-id", nil)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+func TestRoleHandler_SetUserRoles_RepoError_500(t *testing.T) {
+	// Seed a user so the 404 guard passes, then set roles.Err so SetUserRoles fails.
+	_, roles, users := mountRoles(t)
+	u := &domain.User{Username: "bob", Email: "bob@test.com"}
+	require.NoError(t, users.Create(testContext(), u))
+	roles.Err = errors.New("db down")
+
+	// Remount so the handler uses the same (now-errored) roles mock.
+	h := handlers.NewRoleHandler(roles, users)
+	r2 := gin.New()
+	r2.PUT("/service/rest/v1/security/users/:userId/roles", h.SetUserRoles)
+
+	rec := do(t, r2, http.MethodPut, "/service/rest/v1/security/users/bob/roles",
+		map[string]any{"roleIds": []string{"r1"}})
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}

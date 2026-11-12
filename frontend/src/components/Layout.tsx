@@ -1,0 +1,539 @@
+import { useState } from 'react'
+import { Outlet, NavLink } from 'react-router-dom'
+import {
+  Home, Search, FolderOpen, Trash2,
+  Settings, Shield, FileText, LogOut,
+  Key, LogIn, Plus, X, Copy, Check,
+  BookOpen, ChevronLeft, ChevronRight,
+} from 'lucide-react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import styles from './Layout.module.css'
+import { useAuthStore } from '@/store/authStore'
+import { apiClient, nexusApi, apiErrorMessage } from '@/api/client'
+import { usePasswordMinLength, tooShort, passwordTooShortMessage } from '@/hooks/usePasswordPolicy'
+import logo from '@/assets/logo.png'
+import miniLogo from '@/assets/mini_logo.png'
+import { HoloApp, HoloModal, HoloButton, HoloInput } from '@/components/holo'
+import { Truncated } from '@/components/Truncated'
+import { ThemeToggle } from '@/components/ThemeToggle'
+
+const navItems = [
+  { to: '/repositories', icon: Home,       label: 'Repositories' },
+  { to: '/browse',       icon: FolderOpen,  label: 'Browse' },
+  { to: '/search',       icon: Search,      label: 'Search' },
+]
+
+const systemItems = [
+  { to: '/security',   icon: Shield,    label: 'Security' },
+  { to: '/admin',      icon: Settings,  label: 'System Admin' },
+  { to: '/audit',      icon: FileText,  label: 'Audit Log' },
+  { to: '/cleanup',    icon: Trash2,    label: 'Cleanup Policies' },
+]
+
+interface UserToken { id: string; name: string; createdAt: string; lastUsedAt?: string; expiresAt?: string }
+interface NewToken  { id: string; name: string; token: string }
+type ProfileTab = 'tokens' | 'password' | 'account'
+
+function ProfileModal({ onClose }: { onClose: () => void }) {
+  const qc = useQueryClient()
+  const user = useAuthStore(s => s.user)
+  const [tab, setTab] = useState<ProfileTab>('tokens')
+
+  const { data: tokens = [], isLoading } = useQuery<UserToken[]>({
+    queryKey: ['my-tokens'],
+    queryFn: () => apiClient.get<UserToken[]>('/api/v1/tokens').then(r => r.data ?? []),
+  })
+  const { data: tokenPolicy } = useQuery<{ tokenMaxDays: number }>({
+    queryKey: ['token-policy'],
+    queryFn: () => apiClient.get<{ tokenMaxDays: number }>('/api/v1/auth/token-policy').then(r => r.data),
+    staleTime: Infinity,
+  })
+  const maxDays = tokenPolicy?.tokenMaxDays ?? 90
+
+  const [name, setName] = useState('')
+  const [expiryDays, setExpiryDays] = useState('')
+  const [newToken, setNewToken] = useState<NewToken | null>(null)
+  const [creating, setCreating] = useState(false)
+  const [copied, setCopied] = useState(false)
+
+  const expiryError = (() => {
+    if (!expiryDays) return ''
+    const d = parseInt(expiryDays, 10)
+    if (isNaN(d) || d < 1) return 'Expiry must be at least 1 day'
+    if (d > maxDays) return `Expiry exceeds the maximum of ${maxDays} days`
+    return ''
+  })()
+
+  async function create() {
+    if (!name.trim()) return
+    setCreating(true)
+    try {
+      const payload: Record<string, unknown> = { name: name.trim() }
+      const days = parseInt(expiryDays, 10)
+      if (expiryDays && !isNaN(days) && days > 0) payload.expiresInDays = days
+      const res = await apiClient.post<NewToken>('/api/v1/tokens', payload)
+      setNewToken(res.data)
+      setName('')
+      setExpiryDays('')
+      setCopied(false)
+      qc.invalidateQueries({ queryKey: ['my-tokens'] })
+    } finally { setCreating(false) }
+  }
+
+  function copyToken() {
+    if (!newToken) return
+    void navigator.clipboard.writeText(newToken.token).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
+  }
+
+  const del = useMutation({
+    mutationFn: (id: string) => apiClient.delete(`/api/v1/tokens/${id}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['my-tokens'] }),
+  })
+
+  // ── Change password (local accounts only) ─────────────────
+  const [curPw, setCurPw] = useState('')
+  const [newPw, setNewPw] = useState('')
+  const [confirmPw, setConfirmPw] = useState('')
+  const [pwErr, setPwErr] = useState('')
+  const [pwChanged, setPwChanged] = useState(false)
+  const pwMinLength = usePasswordMinLength()
+
+  // A missing source predates the field (an older build issued the session) —
+  // treat it as local so dev/bootstrap keeps working; only a *known* external
+  // source hides the section (no dead inputs for SSO users).
+  const isLocalAccount = !user?.source || user.source === 'local'
+
+  const changePw = useMutation({
+    mutationFn: ({ oldPassword, newPassword }: { oldPassword: string; newPassword: string }) =>
+      nexusApi.changeMyPassword(oldPassword, newPassword),
+    onSuccess: () => {
+      setPwChanged(true)
+      // The backend revokes every JWT on a password change (tokens_valid_after
+      // is bumped) — including this session's. Keeping the UI "logged in" would
+      // just 401 on the next call, so the honest UX is to sign the user out
+      // here and have them return with the new password. The store singleton is
+      // read fresh so this logout is the live one, not a stale render closure.
+      setTimeout(() => useAuthStore.getState().logout(), 1500)
+    },
+    onError: (e) => setPwErr(apiErrorMessage(e, 'Failed to change password')),
+  })
+
+  function submitPasswordChange(e: React.FormEvent) {
+    e.preventDefault()
+    if (newPw !== confirmPw) { setPwErr('The two passwords do not match'); return }
+    // A mirror of the server rule, so the user is told before the round trip.
+    // The server still enforces it — an unknown minimum just submits.
+    if (tooShort(newPw, pwMinLength)) { setPwErr(passwordTooShortMessage(pwMinLength as number)); return }
+    setPwErr('')
+    changePw.mutate({ oldPassword: curPw, newPassword: newPw })
+  }
+
+  const S = {
+    header:    { display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
+    title:     { fontSize: 16, fontWeight: 700, color: 'var(--holo-text)', display: 'flex', alignItems: 'center', gap: 8 },
+    tokenList: { maxHeight: 240, overflowY: 'auto' as const, display: 'flex', flexDirection: 'column' as const },
+    row:       { display: 'flex', alignItems: 'flex-start', gap: 10, padding: '10px 0', borderBottom: '1px solid rgba(var(--holo-ink-rgb), 0.06)', minWidth: 0 },
+    rowMeta:   { flex: 1, minWidth: 0 },
+    rowName:   { fontWeight: 600, fontSize: 13, color: 'var(--holo-text)' },
+    rowDates:  { fontSize: 11, color: 'var(--holo-text-dim)', marginTop: 2, lineHeight: 1.4 },
+    empty:     { color: 'var(--holo-text-dim)', fontSize: 13, padding: '12px 0' },
+    mono:      { fontFamily: 'ui-monospace,monospace' },
+    nav:       { display: 'flex', flexDirection: 'column' as const, gap: 4, width: 150, flexShrink: 0 },
+    navItem:   { textAlign: 'left' as const, padding: '9px 12px', borderRadius: 10, border: '1px solid transparent', background: 'none', color: 'var(--holo-text-dim)', fontSize: 13, fontWeight: 500, cursor: 'pointer' },
+    navItemActive: { background: 'rgba(var(--holo-a-rgb, 139,92,246), 0.14)', borderColor: 'rgba(var(--holo-a-rgb, 139,92,246), 0.35)', color: 'var(--holo-text)', fontWeight: 600 },
+    panel:     { flex: 1, minWidth: 0, height: 480, overflowY: 'auto' as const, paddingRight: 4 },
+    dl:        { display: 'grid', gridTemplateColumns: '110px 1fr', rowGap: 10, columnGap: 12, margin: 0, fontSize: 13 },
+    dt:        { color: 'var(--holo-text-faint)' },
+    dd:        { margin: 0, color: 'var(--holo-text)', minWidth: 0, overflowWrap: 'anywhere' as const },
+    chip:      { fontSize: 11, padding: '2px 8px', borderRadius: 999, background: 'rgba(var(--holo-ink-rgb), 0.08)', border: '1px solid rgba(var(--holo-ink-rgb), 0.12)', color: 'var(--holo-text)' },
+  }
+
+  const tabs: { id: ProfileTab; label: string }[] = [
+    { id: 'tokens', label: 'API Tokens' },
+    ...(isLocalAccount ? [{ id: 'password' as const, label: 'Password' }] : []),
+    { id: 'account', label: 'Account' },
+  ]
+  const shown: ProfileTab = tab === 'password' && !isLocalAccount ? 'tokens' : tab
+  const fullName = [user?.firstName, user?.lastName].filter(Boolean).join(' ')
+
+  return (
+    <HoloModal open={true} onClose={onClose} style={{ width: 760, maxWidth: 'calc(100vw - 32px)' }}>
+      <div style={S.header}>
+        <div style={S.title}>
+          <Key size={16} style={{ color: 'var(--holo-a)' }} />
+          Profile — {user?.username}
+        </div>
+        <button style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--holo-text-dim)', padding: 4, display: 'flex' }} onClick={onClose} aria-label="Close"><X size={18} /></button>
+      </div>
+
+      <div style={{ display: 'flex', gap: 16, minWidth: 0 }}>
+        {/* Categories on the left; the panel on the right keeps one size, so
+            switching category does not resize or move the dialog. */}
+        <div role="tablist" aria-orientation="vertical" aria-label="Profile sections" style={S.nav}>
+          {tabs.map(t => (
+            <button
+              key={t.id}
+              role="tab"
+              id={`profile-tab-${t.id}`}
+              aria-selected={shown === t.id}
+              aria-controls="profile-panel"
+              onClick={() => setTab(t.id)}
+              style={{ ...S.navItem, ...(shown === t.id ? S.navItemActive : null) }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        <div
+          role="tabpanel"
+          id="profile-panel"
+          aria-labelledby={`profile-tab-${shown}`}
+          style={S.panel}
+        >
+          {shown === 'tokens' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <div className="holo-card" style={{ padding: 16 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--holo-text)', marginBottom: 10 }}>Create API Token</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 8 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <label htmlFor="token-name" style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>Token name</label>
+              <HoloInput
+                id="token-name"
+                placeholder="e.g. ci-deploy"
+                value={name}
+                onChange={e => setName(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && !expiryError && create()}
+              />
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label htmlFor="expiry-days" style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>
+                  Expiry (days, optional)
+                </label>
+                <HoloInput
+                  id="expiry-days"
+                  type="number"
+                  min={1}
+                  max={maxDays}
+                  style={{ width: 160, borderColor: expiryError ? 'rgba(255,107,107,0.6)' : undefined }}
+                  placeholder={`max ${maxDays}`}
+                  value={expiryDays}
+                  onChange={e => setExpiryDays(e.target.value)}
+                  title={`Leave empty for no expiry. Maximum ${maxDays} days.`}
+                />
+              </div>
+              <HoloButton
+                variant="default"
+                icon={<Plus size={14} />}
+                onClick={create}
+                disabled={creating || !name.trim() || !!expiryError}
+                style={{ background: 'rgba(59,130,246,0.15)', borderColor: 'rgba(59,130,246,0.4)', color: 'var(--holo-c-blue-400)', whiteSpace: 'nowrap' }}
+              >
+                {creating ? 'Creating…' : 'Create token'}
+              </HoloButton>
+            </div>
+          </div>
+          {expiryError
+            ? <div style={{ fontSize: 11, color: 'var(--holo-red)' }}>{expiryError}</div>
+            : <div style={{ fontSize: 11, color: 'var(--holo-text-faint)' }}>
+                Expiry is optional — leave blank for a non-expiring token (max {maxDays} days)
+              </div>
+          }
+        </div>
+
+        {newToken && (
+          <div className="holo-card" style={{ padding: 16, background: 'rgba(94,255,184,0.08)', border: '1px solid rgba(94,255,184,0.25)' }}>
+            <div style={{ fontSize: 13, color: 'var(--holo-green)', fontWeight: 600, marginBottom: 8 }}>
+              Token created — copy it now, it won't be shown again
+            </div>
+            <code style={{ ...S.mono, fontSize: 12, background: 'var(--holo-well-30)', padding: '8px 12px', borderRadius: 8, display: 'block', wordBreak: 'break-all' as const, color: 'var(--holo-a)' }}>
+              {newToken.token}
+            </code>
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              <HoloButton
+                variant="primary"
+                icon={copied ? <Check size={14} /> : <Copy size={14} />}
+                onClick={copyToken}
+                style={copied ? { background: 'rgba(34,211,238,0.2)', borderColor: 'rgba(34,211,238,0.4)', color: 'var(--holo-b)' } : undefined}
+              >
+                {copied ? 'Copied!' : 'Copy'}
+              </HoloButton>
+              <HoloButton onClick={() => setNewToken(null)}>Dismiss</HoloButton>
+            </div>
+          </div>
+        )}
+
+        <div className="holo-card" style={{ padding: 16 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--holo-text)', marginBottom: 10 }}>
+            Your API Tokens {tokens.length > 0 && <span style={{ fontWeight: 400, color: 'var(--holo-text-faint)', fontSize: 12 }}>({tokens.length})</span>}
+          </div>
+          {isLoading
+            ? <div style={S.empty}>Loading…</div>
+            : tokens.length === 0
+              ? <div style={S.empty}>No tokens yet</div>
+              : (
+                <div style={S.tokenList}>
+                  {tokens.map(t => (
+                    <div key={t.id} style={S.row}>
+                      <Key size={13} style={{ color: 'var(--holo-a)', flexShrink: 0, marginTop: 2 }} />
+                      <div style={S.rowMeta}>
+                        <Truncated text={t.name} style={S.rowName} />
+                        <div style={S.rowDates}>
+                          Created {new Date(t.createdAt).toLocaleDateString()}
+                          {t.lastUsedAt && ` · Last used ${new Date(t.lastUsedAt).toLocaleDateString()}`}
+                          {t.expiresAt && ` · Expires ${new Date(t.expiresAt).toLocaleDateString()}`}
+                        </div>
+                      </div>
+                      <HoloButton variant="danger" icon={<Trash2 size={13} />} onClick={() => del.mutate(t.id)} aria-label="Delete token" style={{ flexShrink: 0 }} />
+                    </div>
+                  ))}
+                </div>
+              )
+          }
+        </div>
+
+            </div>
+          )}
+
+          {shown === 'password' && (
+            <div>
+          {pwChanged ? (
+          <div className="holo-card" style={{ padding: 16, background: 'rgba(94,255,184,0.08)', border: '1px solid rgba(94,255,184,0.25)' }}>
+            <div style={{ fontSize: 13, color: 'var(--holo-green)', fontWeight: 600 }}>
+              Password changed — please sign in again.
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--holo-text-faint)', marginTop: 4 }}>
+              Signing you out… every browser session was revoked. API tokens are
+              separate credentials and keep working.
+            </div>
+          </div>
+        ) : (
+          <div className="holo-card" style={{ padding: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--holo-text)', marginBottom: 10 }}>Change Password</div>
+            <form onSubmit={submitPasswordChange} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label htmlFor="cur-password" style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>Current password</label>
+                <HoloInput id="cur-password" type="password" value={curPw} onChange={e => setCurPw(e.target.value)} required autoComplete="current-password" />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label htmlFor="new-password" style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>New password</label>
+                <HoloInput id="new-password" type="password" value={newPw} onChange={e => setNewPw(e.target.value)} required autoComplete="new-password" />
+                {pwMinLength !== undefined && (
+                  <div style={{ fontSize: 11, color: 'var(--holo-text-faint)' }}>At least {pwMinLength} characters</div>
+                )}
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label htmlFor="new-password-confirm" style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>Confirm new password</label>
+                <HoloInput id="new-password-confirm" type="password" value={confirmPw} onChange={e => setConfirmPw(e.target.value)} required autoComplete="new-password" />
+              </div>
+              {pwErr && <div role="alert" style={{ fontSize: 11, color: 'var(--holo-red)' }}>{pwErr}</div>}
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 4 }}>
+                <HoloButton variant="primary" type="submit" disabled={changePw.isPending}>
+                  {changePw.isPending ? 'Saving…' : 'Change password'}
+                </HoloButton>
+              </div>
+            </form>
+          </div>
+          )}
+            </div>
+          )}
+
+          {shown === 'account' && (
+            <div className="holo-card" style={{ padding: 16 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--holo-text)', marginBottom: 12 }}>Account</div>
+              <dl style={S.dl}>
+                <dt style={S.dt}>Username</dt><dd style={S.dd}>{user?.username}</dd>
+                {fullName && (<><dt style={S.dt}>Name</dt><dd style={S.dd}>{fullName}</dd></>)}
+                {user?.email && (<><dt style={S.dt}>Email</dt><dd style={S.dd}>{user.email}</dd></>)}
+                <dt style={S.dt}>Sign-in</dt><dd style={S.dd}>{user?.source || 'local'}</dd>
+                <dt style={S.dt}>Roles</dt>
+                <dd style={{ ...S.dd, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {(user?.roles ?? []).length === 0
+                    ? <span style={{ color: 'var(--holo-text-dim)' }}>none</span>
+                    : user!.roles.map(r => <span key={r} style={S.chip}>{r}</span>)}
+                </dd>
+              </dl>
+            </div>
+          )}
+        </div>
+      </div>
+    </HoloModal>
+  )
+}
+
+export default function Layout() {
+  const { user, logout, isAdmin, isOIDC } = useAuthStore()
+  const admin = isAdmin()
+  const [profileOpen, setProfileOpen] = useState(false)
+  const [collapsed, setCollapsed] = useState(() =>
+    localStorage.getItem('sidebar-collapsed') === 'true'
+  )
+
+  const { data: systemInfo } = useQuery<{ version: string }>({
+    queryKey: ['system-info'],
+    queryFn: () => apiClient.get<{ version: string }>('/api/v1/system/info').then(r => r.data),
+    staleTime: Infinity,
+    enabled: admin,
+  })
+
+  function toggleCollapse() {
+    const next = !collapsed
+    setCollapsed(next)
+    localStorage.setItem('sidebar-collapsed', String(next))
+  }
+
+  return (
+    <HoloApp>
+    <div className={`${styles.root}${collapsed ? ' ' + styles.collapsed : ''}`}>
+      <a href="#main-content" className={styles.skipLink}>Skip to content</a>
+      <aside className={styles.sidebar}>
+        <div className={styles.navScrollArea}>
+          {/* Brand */}
+          <div className={styles.brand}>
+            <img
+              src={collapsed ? miniLogo : logo}
+              alt="Nexspence"
+              className={collapsed ? styles.brandLogoMini : styles.brandLogo}
+            />
+          </div>
+
+          {/* Primary nav */}
+          <span className={styles.sectionLabel}>Browse</span>
+          <nav className={styles.nav}>
+            {navItems.map(({ to, icon: Icon, label }) => (
+              <NavLink
+                key={to}
+                to={to}
+                title={collapsed ? label : undefined}
+                className={({ isActive }) =>
+                  `${styles.navBtn} ${isActive ? styles.active : ''}`
+                }
+              >
+                <Icon size={16} />
+                <span className={styles.navLabel}>{label}</span>
+              </NavLink>
+            ))}
+          </nav>
+
+          {admin && (
+            <>
+              <hr className={styles.divider} />
+              <span className={styles.sectionLabel}>System</span>
+              <nav className={styles.nav}>
+                {systemItems.map(({ to, icon: Icon, label }) => (
+                  <NavLink
+                    key={to}
+                    to={to}
+                    title={collapsed ? label : undefined}
+                    className={({ isActive }) =>
+                      `${styles.navBtn} ${isActive ? styles.active : ''}`
+                    }
+                  >
+                    <Icon size={16} />
+                    <span className={styles.navLabel}>{label}</span>
+                  </NavLink>
+                ))}
+              </nav>
+            </>
+          )}
+
+          {/* Docs */}
+          <hr className={styles.divider} />
+          <span className={`${styles.sectionLabel} ${styles.sectionLabelDocs}`}>Docs</span>
+          <nav className={styles.nav}>
+            <NavLink
+              to="/docs"
+              title={collapsed ? 'Documentation' : undefined}
+              className={({ isActive }) =>
+                `${styles.navBtn} ${styles.navBtnDocs}${isActive ? ' ' + styles.active : ''}`
+              }
+            >
+              <BookOpen size={16} />
+              <span className={styles.navLabel}>Documentation</span>
+            </NavLink>
+          </nav>
+        </div>
+
+        {/* Command bar — pill */}
+        {user && (
+          <div className={styles.commandBar}>
+            <button
+              className={styles.commandBarAvatar}
+              onClick={() => setProfileOpen(true)}
+              title="Profile"
+            >
+              {(user.firstName || user.username || '?')[0].toUpperCase()}
+            </button>
+            <div className={styles.commandBarUser}>
+              <Truncated as="span" className={styles.commandBarUserName} text={user.firstName || user.username} />
+            </div>
+            <button
+              className={styles.commandBarAction}
+              onClick={() => setProfileOpen(true)}
+              title="API Tokens & Profile"
+            >
+              <Key size={11} />
+            </button>
+            <button
+              className={`${styles.commandBarAction} ${styles.commandBarActionDanger}`}
+              title="Sign Out"
+              onClick={async () => {
+                if (isOIDC()) {
+                  try {
+                    const res = await apiClient.get('/api/v1/auth/oidc/logout')
+                    logout()
+                    window.location.href = res.data.logout_url
+                  } catch {
+                    logout()
+                  }
+                } else {
+                  logout()
+                }
+              }}
+            >
+              <LogOut size={11} />
+            </button>
+          </div>
+        )}
+        {/* A signed-out visitor browsing public repositories still needs a way
+            in — the pill would otherwise be missing entirely (#404). */}
+        {!user && (
+          <div className={styles.commandBar}>
+            <NavLink to="/login" className={styles.commandBarAvatar} title="Sign in">
+              <LogIn size={13} />
+            </NavLink>
+            <div className={styles.commandBarUser}>
+              <Truncated as="span" className={styles.commandBarUserName} text="Not signed in" />
+            </div>
+            <NavLink to="/login" className={styles.commandBarAction} title="Sign in">
+              <Key size={11} />
+            </NavLink>
+          </div>
+        )}
+        <span className={styles.version}>Nexspence v{systemInfo?.version ?? '…'}</span>
+        <span className={styles.version}>Mod by Vasiliy Isaichkin</span>
+        <div className={styles.footerRow}>
+          <ThemeToggle className={styles.themeToggle} />
+          <button
+            className={styles.collapseButton}
+            onClick={toggleCollapse}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            {collapsed ? <ChevronRight size={13} /> : <ChevronLeft size={13} />}
+          </button>
+        </div>
+      </aside>
+
+      <main id="main-content" className={styles.main}>
+        <Outlet />
+      </main>
+
+      {profileOpen && <ProfileModal onClose={() => setProfileOpen(false)} />}
+    </div>
+    </HoloApp>
+  )
+}

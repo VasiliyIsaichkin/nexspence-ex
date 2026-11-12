@@ -1,0 +1,988 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/google/cel-go/cel"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/formats/base"
+	"github.com/nexspence-oss/nexspence/internal/repository"
+	"github.com/nexspence-oss/nexspence/internal/storage"
+)
+
+// PromotionService copies artifacts between repositories according to promotion rules.
+type PromotionService struct {
+	promotionRepo repository.PromotionRepo
+	componentRepo repository.ComponentRepo
+	assetRepo     repository.AssetRepo
+	repoRepo      repository.RepositoryRepo
+	blobRepo      repository.BlobStoreRepo
+	scanRepo      repository.ScanResultRepo
+	blobResolver  StoreResolver
+	webhooks      domain.WebhookDispatcher
+	// auto is nil until WithAutoPromotion enables auto-promotion (#542).
+	auto *autoPromotion
+
+	celEnv *cel.Env
+}
+
+// NewPromotionService constructs a service for build promotion between repositories,
+// initializing the CEL environment used to evaluate rule path filters.
+func NewPromotionService(
+	promotionRepo repository.PromotionRepo,
+	componentRepo repository.ComponentRepo,
+	assetRepo repository.AssetRepo,
+	repoRepo repository.RepositoryRepo,
+	blobRepo repository.BlobStoreRepo,
+	scanRepo repository.ScanResultRepo,
+	blobResolver StoreResolver,
+) (*PromotionService, error) {
+	env, err := cel.NewEnv(
+		cel.Variable("format", cel.StringType),
+		cel.Variable("path", cel.StringType),
+		cel.Variable("repository", cel.StringType),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("promotion cel env: %w", err)
+	}
+	return &PromotionService{
+		promotionRepo: promotionRepo,
+		componentRepo: componentRepo,
+		assetRepo:     assetRepo,
+		repoRepo:      repoRepo,
+		blobRepo:      blobRepo,
+		scanRepo:      scanRepo,
+		blobResolver:  blobResolver,
+		celEnv:        env,
+	}, nil
+}
+
+// WithWebhooks attaches a dispatcher for promotion lifecycle events and returns s.
+func (s *PromotionService) WithWebhooks(w domain.WebhookDispatcher) *PromotionService {
+	s.webhooks = w
+	return s
+}
+
+// matchesPathFilter returns true when the component matches the rule's path filter.
+// An empty PathFilter matches everything; a filter that fails to compile or
+// evaluate matches nothing (the enforcement path reports that distinctly).
+func (s *PromotionService) matchesPathFilter(rule domain.PromotionRule, comp *domain.Component) bool {
+	matched, err := s.evalPathFilter(rule, comp)
+	return err == nil && matched
+}
+
+// evalPathFilter evaluates the rule's path filter against the component,
+// separating "did not match" from "the filter itself is broken" — a rule
+// whose filter errors must fail closed, but with an error that sends the
+// operator to the filter, not the component.
+func (s *PromotionService) evalPathFilter(rule domain.PromotionRule, comp *domain.Component) (bool, error) {
+	if rule.PathFilter == "" {
+		return true, nil
+	}
+	ast, issues := s.celEnv.Compile(rule.PathFilter)
+	if issues != nil && issues.Err() != nil {
+		return false, fmt.Errorf("path filter does not compile: %w", issues.Err())
+	}
+	prg, err := s.celEnv.Program(ast)
+	if err != nil {
+		return false, fmt.Errorf("path filter does not compile: %w", err)
+	}
+	path := "/" + comp.Group + "/" + comp.Name
+	vars := map[string]any{
+		"format":     comp.Format,
+		"path":       path,
+		"repository": comp.Repository,
+	}
+	out, _, err := prg.Eval(vars)
+	if err != nil {
+		return false, fmt.Errorf("path filter failed to evaluate: %w", err)
+	}
+	matched, ok := out.Value().(bool)
+	if !ok {
+		return false, fmt.Errorf("path filter evaluates to %T, not a boolean", out.Value())
+	}
+	return matched, nil
+}
+
+// ErrAmbiguousPromotionRule reports that more than one promotion rule covers the
+// same component for the same repository pair. Callers map it to 409: it is not
+// a malformed request, it is a configuration the server refuses to guess at.
+var ErrAmbiguousPromotionRule = errors.New("more than one promotion rule applies")
+
+// ruleAppliesTo reports whether the rule actually covers the component: the
+// component lives in the rule's from_repo and passes its path filter. This is
+// the same test ListRulesForComponent offers rules by — but offering is not
+// enforcing: Promote takes a caller-supplied (rule_id, component_id) pair, so
+// without this check any caller with promotion permission could promote an
+// arbitrary component with whichever rule has the laxest gates, bypassing a
+// stricter rule's require_scan_pass/require_manual_approval on the pair that
+// actually covers it (#255).
+func (s *PromotionService) ruleAppliesTo(ctx context.Context, rule *domain.PromotionRule, comp *domain.Component) error {
+	if comp.Repository != rule.FromRepo {
+		return fmt.Errorf("component %s lives in repository %q, which rule %q does not promote from (%q)",
+			comp.ID, comp.Repository, rule.Name, rule.FromRepo)
+	}
+	matched, err := s.evalPathFilter(*rule, comp)
+	if err != nil {
+		// Fail closed, but honestly: a broken filter is the rule's problem,
+		// and "does not match" would send the operator to the wrong place.
+		return fmt.Errorf("rule %q: %w", rule.Name, err)
+	}
+	if !matched {
+		return fmt.Errorf("component %s does not match rule %q's path filter", comp.ID, rule.Name)
+	}
+	return s.noSiblingRuleApplies(ctx, rule, comp)
+}
+
+// noSiblingRuleApplies refuses a promotion that more than one rule covers.
+//
+// Confirming the named rule covers the component is not enough: two rules on
+// the same repository pair can both cover it with different gates, and naming
+// the laxer one then completes a promotion the stricter one's
+// require_scan_pass/require_manual_approval would have blocked — no error, no
+// warning, nothing recording that a gate was routed around (#366). Since the
+// server cannot tell which rule the caller meant, the refusal is symmetric:
+// naming either one is refused, including the stricter one, until an operator
+// deletes or narrows a rule so exactly one applies.
+func (s *PromotionService) noSiblingRuleApplies(ctx context.Context, rule *domain.PromotionRule, comp *domain.Component) error {
+	siblings, err := s.promotionRepo.ListRulesByFromRepo(ctx, comp.Repository)
+	if err != nil {
+		return fmt.Errorf("cannot check whether other rules cover component %s: %w", comp.ID, err)
+	}
+	for i := range siblings {
+		sib := siblings[i]
+		if sib.ID == rule.ID || sib.ToRepo != rule.ToRepo {
+			continue
+		}
+		matched, ferr := s.evalPathFilter(sib, comp)
+		if ferr != nil {
+			// A sibling whose filter cannot be evaluated may well cover this
+			// component; letting the promotion through would be exactly the
+			// bypass this check exists to prevent.
+			return fmt.Errorf("%w: rule %q also promotes %q→%q and its path filter could not be evaluated: %w",
+				ErrAmbiguousPromotionRule, sib.Name, sib.FromRepo, sib.ToRepo, ferr)
+		}
+		if matched {
+			return fmt.Errorf("%w: rules %q and %q both cover component %s from %q to %q — "+
+				"delete or narrow one of them, since naming either decides which gates apply",
+				ErrAmbiguousPromotionRule, rule.Name, sib.Name, comp.ID, rule.FromRepo, rule.ToRepo)
+		}
+	}
+	return nil
+}
+
+// ListRules returns all promotion rules.
+func (s *PromotionService) ListRules(ctx context.Context) ([]domain.PromotionRule, error) {
+	return s.promotionRepo.ListRules(ctx)
+}
+
+// GetRule returns the promotion rule with the given id.
+func (s *PromotionService) GetRule(ctx context.Context, id string) (*domain.PromotionRule, error) {
+	return s.promotionRepo.GetRule(ctx, id)
+}
+
+// CreateRule validates and persists a new promotion rule.
+func (s *PromotionService) CreateRule(ctx context.Context, rule *domain.PromotionRule) error {
+	if rule.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if rule.FromRepo == "" || rule.ToRepo == "" {
+		return fmt.Errorf("from_repo and to_repo are required")
+	}
+	if rule.FromRepo == rule.ToRepo {
+		return fmt.Errorf("from_repo and to_repo must be different")
+	}
+	if rule.PathFilter != "" {
+		ast, issues := s.celEnv.Compile(rule.PathFilter)
+		if issues != nil && issues.Err() != nil {
+			return fmt.Errorf("invalid path_filter CEL expression: %w", issues.Err())
+		}
+		// A filter that compiles to a non-bool (`path`, `"foo"`) would fail
+		// every applicability check downstream while looking valid here.
+		if ast.OutputType() != cel.BoolType {
+			return fmt.Errorf("invalid path_filter CEL expression: must evaluate to a boolean, not %s", ast.OutputType())
+		}
+	}
+	if err := normalizeRuleSeverities(rule); err != nil {
+		return err
+	}
+	if err := s.validateAutoPromote(ctx, rule); err != nil {
+		return err
+	}
+	return s.promotionRepo.CreateRule(ctx, rule)
+}
+
+// UpdateRule validates and persists changes to an existing promotion rule.
+func (s *PromotionService) UpdateRule(ctx context.Context, rule *domain.PromotionRule) error {
+	if rule.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	// CreateRule's own emptiness check, which this sibling was missing. The
+	// FromRepo == ToRepo test below happens to catch a rule with *both* sides
+	// blank ("" == ""), but not one with a single side blank, so a PUT with
+	// from_repo:"" persisted an orphaned rule that no promotion could ever
+	// match.
+	if rule.FromRepo == "" || rule.ToRepo == "" {
+		return fmt.Errorf("from_repo and to_repo are required")
+	}
+	if rule.FromRepo == rule.ToRepo {
+		return fmt.Errorf("from_repo and to_repo must be different")
+	}
+	if rule.PathFilter != "" {
+		ast, issues := s.celEnv.Compile(rule.PathFilter)
+		if issues != nil && issues.Err() != nil {
+			return fmt.Errorf("invalid path_filter CEL expression: %w", issues.Err())
+		}
+		if ast.OutputType() != cel.BoolType {
+			return fmt.Errorf("invalid path_filter CEL expression: must evaluate to a boolean, not %s", ast.OutputType())
+		}
+	}
+	if err := normalizeRuleSeverities(rule); err != nil {
+		return err
+	}
+	if err := s.validateAutoPromote(ctx, rule); err != nil {
+		return err
+	}
+	return s.promotionRepo.UpdateRule(ctx, rule)
+}
+
+// validateAutoPromote refuses auto_promote on a rule whose from_repo can never
+// be published into: only a client write into a hosted repository starts an
+// automatic promotion (#542), so on a proxy or group source the switch would
+// look on and do nothing. A from_repo that does not exist is left to the
+// foreign key, as it is for every rule.
+func (s *PromotionService) validateAutoPromote(ctx context.Context, rule *domain.PromotionRule) error {
+	if !rule.AutoPromote {
+		return nil
+	}
+	from, err := s.repoRepo.Get(ctx, rule.FromRepo)
+	if lookupMissing(from, err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check from_repo %q: %w", rule.FromRepo, err)
+	}
+	if from.Type != domain.TypeHosted {
+		return fmt.Errorf("auto_promote needs a hosted from_repo: %q is a %s repository, which clients do not publish into",
+			from.Name, from.Type)
+	}
+	return nil
+}
+
+// normalizeRuleSeverities validates the rule's scan_fail_severities and
+// rewrites them lower-cased, deduplicated and in canonical order. An empty list
+// is accepted and means the default (malicious, critical, high), so a client
+// that predates the field keeps the gate it always had.
+func normalizeRuleSeverities(rule *domain.PromotionRule) error {
+	sevs, err := domain.NormalizeScanSeverities(rule.ScanFailSeverities)
+	if err != nil {
+		return fmt.Errorf("invalid scan_fail_severities: %w", err)
+	}
+	rule.ScanFailSeverities = sevs
+	return nil
+}
+
+// DeleteRule removes the promotion rule with the given id.
+func (s *PromotionService) DeleteRule(ctx context.Context, id string) error {
+	return s.promotionRepo.DeleteRule(ctx, id)
+}
+
+// ListRulesForComponent returns promotion rules that apply to the given component.
+func (s *PromotionService) ListRulesForComponent(ctx context.Context, componentID string) ([]domain.PromotionRule, error) {
+	comp, err := s.componentRepo.Get(ctx, componentID)
+	if err != nil || comp == nil {
+		return nil, fmt.Errorf("component not found: %s", componentID)
+	}
+	rules, err := s.promotionRepo.ListRulesByFromRepo(ctx, comp.Repository)
+	if err != nil {
+		return nil, err
+	}
+	var matching []domain.PromotionRule
+	for _, r := range rules {
+		if s.matchesPathFilter(r, comp) {
+			matching = append(matching, r)
+		}
+	}
+	return matching, nil
+}
+
+// ListRequests returns promotion requests, optionally filtered by status.
+func (s *PromotionService) ListRequests(ctx context.Context, status string) ([]domain.PromotionRequest, error) {
+	return s.promotionRepo.ListRequests(ctx, status)
+}
+
+// scanGate refuses promotion when the rule demands a clean scan and the
+// component's latest scan is missing or has findings in any severity the rule
+// fails on (EffectiveScanFailSeverities: its own list, or malicious, critical
+// and high). Malicious is a severity of its own, not folded into the CVE
+// tiers: a malicious-package report has no CVSS level, so a gate reading only
+// Critical/High would pass a compromised release with a spotless CVE record
+// straight into production — which is why the default list leads with it.
+func (s *PromotionService) scanGate(ctx context.Context, rule *domain.PromotionRule, compID string) error {
+	if !rule.RequireScanPass {
+		return nil
+	}
+	scan, err := s.scanRepo.GetLatestByComponent(ctx, compID)
+	if err != nil || scan == nil {
+		return fmt.Errorf("component %s: scan required but not yet run", compID)
+	}
+	failOn := rule.EffectiveScanFailSeverities()
+	var failed []string
+	for _, sev := range failOn {
+		if n := scan.SeverityCount(sev); n > 0 {
+			failed = append(failed, fmt.Sprintf("%d %s", n, sev))
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("component %s: scan has %s findings (rule %q fails on %s)",
+			compID, strings.Join(failed, ", "), rule.Name, strings.Join(failOn, ", "))
+	}
+	return nil
+}
+
+// Promote creates promotion requests for each component. Auto-approves when require_manual_approval=false.
+func (s *PromotionService) Promote(ctx context.Context, ruleID string, componentIDs []string, requestedByID string) ([]domain.PromotionRequest, error) {
+	rule, err := s.promotionRepo.GetRule(ctx, ruleID)
+	if err != nil || rule == nil {
+		return nil, fmt.Errorf("promotion rule not found: %s", ruleID)
+	}
+
+	// The whole batch is validated before anything is created or copied: with
+	// an auto-approve rule the loop below executes copies as it goes, so a
+	// mid-batch refusal would leave earlier components already promoted while
+	// the caller is told the batch failed. Refusing before any request row
+	// exists also spares reviewers pending requests nobody could legitimately
+	// approve.
+	included := make(map[string]int, len(componentIDs))
+	for _, compID := range componentIDs {
+		comp, cerr := s.componentRepo.Get(ctx, compID)
+		if cerr != nil || comp == nil {
+			return nil, fmt.Errorf("component not found: %s", compID)
+		}
+		if aerr := s.ruleAppliesTo(ctx, rule, comp); aerr != nil {
+			return nil, aerr
+		}
+		if serr := s.scanGate(ctx, rule, compID); serr != nil {
+			return nil, serr
+		}
+		// An image missing a layer in the source is refused here, before a
+		// request row exists, rather than failing later at copy time (#541).
+		n, xerr := s.imageDependents(ctx, comp)
+		if xerr != nil {
+			return nil, xerr
+		}
+		included[compID] = n
+		if perr := s.targetPolicyGate(ctx, rule, comp); perr != nil {
+			return nil, perr
+		}
+	}
+
+	var results []domain.PromotionRequest
+	for _, compID := range componentIDs {
+		req := &domain.PromotionRequest{
+			RuleID:             ruleID,
+			ComponentID:        compID,
+			Status:             domain.PromotionPending,
+			RequestedBy:        requestedByID,
+			IncludedComponents: included[compID],
+		}
+		if err := s.promotionRepo.CreateRequest(ctx, req); err != nil {
+			return nil, fmt.Errorf("create promotion request: %w", err)
+		}
+
+		if !rule.RequireManualApproval {
+			// The same row lock Approve takes: the freshly created pending request
+			// is already visible, and a concurrent manual approval racing this
+			// auto-approve would otherwise copy twice.
+			lockErr := s.promotionRepo.WithPendingRequestLock(ctx, req.ID,
+				func(ctx context.Context, lockedReq *domain.PromotionRequest) repository.PromotionOutcome {
+					now := time.Now()
+					// Re-read the rule for every component: an administrator editing
+					// it mid-batch (disabling a gate, narrowing the filter) must
+					// govern the components still to be processed, exactly as it
+					// would if each were approved individually.
+					freshRule, rerr := s.promotionRepo.GetRule(ctx, ruleID)
+					if rerr != nil || freshRule == nil {
+						req.Status = domain.PromotionFailed
+						req.Error = fmt.Sprintf("promotion rule not found: %s", ruleID)
+						return repository.PromotionOutcome{Status: domain.PromotionFailed,
+							CompletedAt: &now, Error: req.Error}
+					}
+					included, copyErr := s.executeCopy(ctx, lockedReq, freshRule)
+					req.IncludedComponents = included
+					if copyErr != nil {
+						req.Status = domain.PromotionFailed
+						req.Error = copyErr.Error()
+						return repository.PromotionOutcome{Status: domain.PromotionFailed,
+							CompletedAt: &now, Error: copyErr.Error()}
+					}
+					req.Status = domain.PromotionCompleted
+					req.CompletedAt = &now
+					return repository.PromotionOutcome{Status: domain.PromotionCompleted, CompletedAt: &now}
+				})
+			if lockErr != nil {
+				// A concurrent reviewer settled this request first; report what the
+				// row says now rather than inventing an outcome.
+				if settled, gerr := s.promotionRepo.GetRequest(ctx, req.ID); gerr == nil && settled != nil {
+					req = settled
+				}
+			}
+		}
+
+		results = append(results, *req)
+	}
+	return results, nil
+}
+
+// Approve approves a pending promotion request and copies the artifact. The
+// pending check, the copy and the status write happen under the request row's
+// lock: two concurrent approvals would otherwise both pass the check and both
+// copy — double blob writes and a double-fired publish webhook.
+func (s *PromotionService) Approve(ctx context.Context, requestID, reviewerID string) error {
+	var copyErr error
+	err := s.promotionRepo.WithPendingRequestLock(ctx, requestID,
+		func(ctx context.Context, req *domain.PromotionRequest) repository.PromotionOutcome {
+			now := time.Now()
+			rule, rerr := s.promotionRepo.GetRule(ctx, req.RuleID)
+			if rerr != nil || rule == nil {
+				copyErr = fmt.Errorf("promotion rule not found: %s", req.RuleID)
+				return repository.PromotionOutcome{Status: domain.PromotionFailed,
+					ReviewedBy: &reviewerID, ReviewedAt: &now, CompletedAt: &now, Error: copyErr.Error()}
+			}
+			if req.Automatic {
+				if gerr := s.autoApprovalGate(ctx, req, rule); gerr != nil {
+					// Not a verdict on the request — the content it names is
+					// still being looked at. It stays pending.
+					copyErr = gerr
+					return repository.PromotionOutcome{Status: domain.PromotionPending}
+				}
+			}
+			// executeCopy re-runs the rule's gates, the scan gate among them,
+			// against the component as it is now — for every request, since
+			// the content may have changed while it sat pending.
+			if _, cerr := s.executeCopy(ctx, req, rule); cerr != nil {
+				copyErr = cerr
+				return repository.PromotionOutcome{Status: domain.PromotionFailed,
+					ReviewedBy: &reviewerID, ReviewedAt: &now, CompletedAt: &now, Error: cerr.Error()}
+			}
+			return repository.PromotionOutcome{Status: domain.PromotionCompleted,
+				ReviewedBy: &reviewerID, ReviewedAt: &now, CompletedAt: &now}
+		})
+	if errors.Is(err, repository.ErrNotFound) {
+		return fmt.Errorf("promotion request not found: %s", requestID)
+	}
+	if err != nil {
+		return err
+	}
+	return copyErr
+}
+
+// autoApprovalGate is what an automatic request (#542) must also pass at
+// approval time. The scan gate executeCopy applies reads the component's
+// latest scan, which after a re-pushed tag or a redeployed SNAPSHOT may still
+// be the previous content's clean one. So:
+//
+//   - a publish the worker has not evaluated yet (a queued row for the pair)
+//     holds the approval: that evaluation either confirms this request or
+//     fails it (autoRun.blocked);
+//   - with require_scan_pass, the latest scan must have started no earlier
+//     than the publish the request was last evaluated for, and must not have
+//     errored.
+func (s *PromotionService) autoApprovalGate(ctx context.Context, req *domain.PromotionRequest, rule *domain.PromotionRule) error {
+	if s.auto != nil {
+		queued, err := s.auto.queue.Queued(ctx, req.RuleID, req.ComponentID)
+		if err != nil {
+			return fmt.Errorf("cannot check for a newer publish of component %s: %w", req.ComponentID, err)
+		}
+		if queued {
+			return fmt.Errorf("component %s was published again after this request was filed and is being "+
+				"re-evaluated; approve it once that is done", req.ComponentID)
+		}
+	}
+	if !rule.RequireScanPass || req.PublishedAt == nil {
+		return nil
+	}
+	scan, err := s.scanRepo.GetLatestByComponent(ctx, req.ComponentID)
+	if err != nil || scan == nil || scan.ScannedAt.Before(*req.PublishedAt) {
+		return fmt.Errorf("component %s has no scan of its current content yet; approve it once it has been scanned",
+			req.ComponentID)
+	}
+	if scan.Status == domain.ScanStatusFailed {
+		return fmt.Errorf("the scan of component %s's current content failed: %s", req.ComponentID, scan.Error)
+	}
+	return nil
+}
+
+// Reject rejects a pending promotion request, under the same row lock Approve
+// takes — a rejection racing an approval must lose to whichever committed
+// first, not silently overwrite it.
+func (s *PromotionService) Reject(ctx context.Context, requestID, reviewerID, reason string) error {
+	err := s.promotionRepo.WithPendingRequestLock(ctx, requestID,
+		func(_ context.Context, _ *domain.PromotionRequest) repository.PromotionOutcome {
+			now := time.Now()
+			return repository.PromotionOutcome{Status: domain.PromotionRejected,
+				ReviewedBy: &reviewerID, ReviewedAt: &now, Error: reason}
+		})
+	if errors.Is(err, repository.ErrNotFound) {
+		return fmt.Errorf("promotion request not found: %s", requestID)
+	}
+	return err
+}
+
+// executeCopy copies a component's blobs and metadata from from_repo to to_repo.
+// For a Docker/OCI manifest it copies the whole image — digest alias, config
+// and layer blobs, child manifests of an index — and returns how many such
+// components came along beyond the one requested (see expandImage). The gates
+// are the requested component's: the rule decides whether this image may be
+// promoted, and the blobs are part of it, not separate artifacts a filter
+// written for tags should be able to strip out of it.
+//
+// The copy is not transactional — the rows and blobs go one at a time — so a
+// mid-copy failure compensates explicitly: every asset row and blob THIS call
+// created fresh is removed, and a target component goes too once nothing
+// references it. Only fresh creations roll back: both ComponentRepo.Create and
+// AssetRepo.Create upsert on conflict, and blindly deleting "what I touched"
+// after an upsert would destroy a legitimate pre-existing component from an
+// earlier successful promotion of the same version. The one acknowledged
+// residual: a pre-existing asset overwritten in place by this call's own upsert
+// keeps the new content — point-in-time rollback of in-place updates is out of
+// scope; what this prevents is the DB-visible half-populated component.
+func (s *PromotionService) executeCopy(ctx context.Context, req *domain.PromotionRequest, rule *domain.PromotionRule) (included int, err error) {
+	comp, err := s.componentRepo.Get(ctx, req.ComponentID)
+	if err != nil || comp == nil {
+		return 0, fmt.Errorf("source component not found: %s", req.ComponentID)
+	}
+	// Re-checked at copy time, not just when the request was filed: Approve
+	// runs later, and the component may have moved, the rule changed, or a
+	// scan found something while the request sat pending — the invariants
+	// have to hold when the bytes actually move.
+	if err := s.ruleAppliesTo(ctx, rule, comp); err != nil {
+		return 0, err
+	}
+	if err := s.scanGate(ctx, rule, comp.ID); err != nil {
+		return 0, err
+	}
+	toRepo, err := s.repoRepo.Get(ctx, rule.ToRepo)
+	if err != nil || toRepo == nil {
+		return 0, fmt.Errorf("target repository not found: %s", rule.ToRepo)
+	}
+
+	toStore, toBlobStoreID, err := s.resolveStore(ctx, toRepo.BlobStoreID)
+	if err != nil {
+		return 0, fmt.Errorf("target %s: %w", toRepo.Name, err)
+	}
+
+	plan, err := s.planCopy(ctx, comp, toRepo, req.Automatic)
+	if err != nil {
+		return 0, err
+	}
+	if req.Automatic && plan.empty() {
+		// Everything this promotion would write is already in the target.
+		return plan.dependents, nil
+	}
+	units, guarded := plan.units, plan.guarded
+
+	// Compensation state for the deferred rollback: only rows and blobs this
+	// call created fresh (rows go before their bytes — a row whose blob is
+	// already gone is not self-healing, an orphan blob is GC'd).
+	var rb copyRollback
+	defer func() {
+		if err != nil {
+			rb.run(ctx, s, toStore)
+		}
+	}()
+
+	for i, u := range units {
+		pending := plan.pending[i]
+		if plan.skipsIdentical(i) && len(pending) == 0 {
+			continue
+		}
+		newComp := &domain.Component{
+			RepositoryID: toRepo.ID,
+			Repository:   toRepo.Name,
+			Format:       string(toRepo.Format),
+			Group:        u.comp.Group,
+			Name:         u.comp.Name,
+			Version:      u.comp.Version,
+			Tags:         u.comp.Tags,
+			Extra:        promotedExtra(u.comp.Extra),
+			// Where the component is listed is the target's own business:
+			// a new copy has no record, an overwritten one keeps the target's.
+			KeepExtraKeys: domain.ListingExtraKeys,
+		}
+		if err = s.componentRepo.Create(ctx, newComp); err != nil {
+			return 0, fmt.Errorf("upsert component in target: %w", err)
+		}
+		rb.compIDs = append(rb.compIDs, newComp.ID)
+		for _, asset := range pending {
+			g := guarded[asset.Path]
+			if err = s.withTargetPathLock(ctx, g, base.BlobKey(toRepo.Name, asset.Path), func(ctx context.Context) error {
+				if g {
+					// A client push may have taken the path since the check above.
+					if _, perr := base.CheckWritePolicy(ctx, s.assetRepo, toRepo, asset.Path); perr != nil {
+						return fmt.Errorf("promote %s to %s: %w", asset.Path, toRepo.Name, perr)
+					}
+				}
+				return s.copyAsset(ctx, asset, newComp, toRepo, toStore, toBlobStoreID, &rb)
+			}); err != nil {
+				return 0, err
+			}
+		}
+	}
+
+	if s.webhooks != nil {
+		// The target component carries the source's coordinates.
+		mainComp := units[0].comp
+		s.webhooks.Dispatch(domain.WebhookPayload{
+			Event:      domain.EventArtifactPublished,
+			Timestamp:  time.Now(),
+			Repository: toRepo.Name,
+			Component: map[string]any{
+				"group":   mainComp.Group,
+				"name":    mainComp.Name,
+				"version": mainComp.Version,
+				"format":  string(toRepo.Format),
+			},
+		})
+	}
+	return plan.dependents, nil
+}
+
+// copyPlan is what one promotion writes into its target: the units, and for
+// each the assets that actually have to be copied.
+type copyPlan struct {
+	units []promotionUnit
+	// pending[i] is the part of units[i].assets to copy.
+	pending [][]domain.Asset
+	// guarded maps a path to copy to whether its write holds the path lock.
+	guarded map[string]bool
+	// dependents is how many units image expansion brought along.
+	dependents int
+	// onlyMissing extends the content-addressed skip to the requested
+	// component's own assets.
+	onlyMissing bool
+}
+
+// skipsIdentical reports whether unit i copies only what the target lacks.
+func (p *copyPlan) skipsIdentical(i int) bool {
+	return p.onlyMissing || p.units[i].contentAddressed
+}
+
+// empty reports whether the plan copies nothing at all.
+func (p *copyPlan) empty() bool {
+	for _, pend := range p.pending {
+		if len(pend) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// planCopy works out what promoting comp into toRepo writes, before the first
+// byte moves: the whole image is resolved and checked present in the source
+// (a missing layer fails the promotion with nothing copied rather than leaving
+// an unpullable half in the target, #541), and the target's write policy (#539)
+// is applied to it, so a refusal copies nothing either.
+//
+// onlyMissing is the automatic-promotion form (#542): a component promoted by
+// itself is promoted again whenever it grows — a Maven sources jar deployed
+// after the jar and pom, say — so the assets the target already holds with the
+// same SHA-256 are skipped like an image's content-addressed parts, and the
+// write policy is applied to what is left. An allow_once target then takes the
+// new file, and refuses only a path whose content actually changed. A manual
+// promotion keeps checking every asset, as it always has.
+func (s *PromotionService) planCopy(ctx context.Context, comp *domain.Component, toRepo *domain.Repository, onlyMissing bool) (*copyPlan, error) {
+	assets, err := s.assetRepo.ListByComponentID(ctx, comp.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list assets: %w", err)
+	}
+	dependents, err := s.expandImage(ctx, comp, assets)
+	if err != nil {
+		return nil, err
+	}
+	plan := &copyPlan{
+		units:       append([]promotionUnit{{comp: comp, assets: assets}}, dependents...),
+		dependents:  len(dependents),
+		onlyMissing: onlyMissing,
+	}
+	var toWrite []domain.Asset
+	for i, u := range plan.units {
+		pending := u.assets
+		if onlyMissing {
+			// A literal maven-metadata.xml a client uploaded is the source's
+			// index; the target generates its own from what it holds, and a
+			// copy would shadow it and hide the target's other versions.
+			pending = withoutSideFiles(domain.RepoFormat(u.comp.Format), pending)
+		}
+		if plan.skipsIdentical(i) {
+			if pending, err = s.missingInTarget(ctx, toRepo.Name, pending); err != nil {
+				return nil, err
+			}
+		}
+		plan.pending = append(plan.pending, pending)
+		toWrite = append(toWrite, pending...)
+	}
+	checked := unitAssets(plan.units)
+	if onlyMissing {
+		checked = toWrite
+	}
+	if plan.guarded, err = s.checkTargetWritePolicy(ctx, toRepo, checked); err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+// copyRollback records what one executeCopy created fresh in the target.
+type copyRollback struct {
+	assetIDs []string
+	blobKeys []string
+	compIDs  []string
+}
+
+// run removes the fresh rows, then their bytes, then every target component
+// the copy touched that nothing references any more.
+func (rb *copyRollback) run(ctx context.Context, s *PromotionService, toStore storage.BlobStore) {
+	for _, id := range rb.assetIDs {
+		_ = s.assetRepo.Delete(ctx, id)
+	}
+	for _, key := range rb.blobKeys {
+		_ = toStore.Delete(ctx, key)
+	}
+	for _, id := range rb.compIDs {
+		remaining, lerr := s.assetRepo.ListByComponentID(ctx, id)
+		if lerr == nil && len(remaining) == 0 {
+			_ = s.componentRepo.Delete(ctx, id)
+		}
+	}
+}
+
+// missingInTarget filters content-addressed assets down to those the target
+// does not already hold. A path that names a digest and already carries the
+// same SHA-256 there is the same bytes — from an earlier promotion of another
+// tag sharing the layer, say — so it is skipped rather than rewritten.
+func (s *PromotionService) missingInTarget(ctx context.Context, toRepo string, assets []domain.Asset) ([]domain.Asset, error) {
+	var out []domain.Asset
+	for _, a := range assets {
+		existing, err := s.assetRepo.GetByPath(ctx, toRepo, a.Path)
+		switch {
+		case errors.Is(err, repository.ErrNotFound) || (err == nil && existing == nil):
+			out = append(out, a)
+		case err != nil:
+			return nil, fmt.Errorf("check target asset %s: %w", a.Path, err)
+		case a.SHA256 == "" || existing.SHA256 != a.SHA256:
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+// copyAsset copies one source asset's bytes and row into newComp.
+func (s *PromotionService) copyAsset(ctx context.Context, asset domain.Asset, newComp *domain.Component,
+	toRepo *domain.Repository, toStore storage.BlobStore, toBlobStoreID string, rb *copyRollback) error {
+	blobStoreID := asset.BlobStoreID
+	fromStore, _, err := s.resolveStore(ctx, &blobStoreID)
+	if err != nil {
+		return fmt.Errorf("source asset %s: %w", asset.Path, err)
+	}
+
+	newBlobKey := base.BlobKey(toRepo.Name, asset.Path)
+
+	// Fresh or pre-existing decides what the rollback may touch: a fresh
+	// path's blob and row are this call's to delete; a pre-existing one was
+	// only overwritten in place and must survive the compensation.
+	_, preErr := s.assetRepo.GetByPath(ctx, toRepo.Name, asset.Path)
+	fresh := errors.Is(preErr, repository.ErrNotFound)
+	if preErr != nil && !fresh {
+		return fmt.Errorf("check target asset %s: %w", asset.Path, preErr)
+	}
+
+	rc, size, err := fromStore.Get(ctx, asset.BlobKey)
+	if err != nil {
+		return fmt.Errorf("read blob %s: %w", asset.BlobKey, err)
+	}
+	if putErr := toStore.Put(ctx, newBlobKey, rc, size); putErr != nil {
+		_ = rc.Close()
+		return fmt.Errorf("write blob %s: %w", newBlobKey, putErr)
+	}
+	_ = rc.Close()
+	if fresh {
+		rb.blobKeys = append(rb.blobKeys, newBlobKey)
+	}
+
+	newAsset := &domain.Asset{
+		ComponentID:  newComp.ID,
+		RepositoryID: toRepo.ID,
+		Repository:   toRepo.Name,
+		Path:         asset.Path,
+		BlobStoreID:  toBlobStoreID,
+		BlobKey:      newBlobKey,
+		SizeBytes:    size,
+		ContentType:  asset.ContentType,
+		SHA256:       asset.SHA256,
+		SHA1:         asset.SHA1,
+		MD5:          asset.MD5,
+	}
+	if err := s.assetRepo.Create(ctx, newAsset); err != nil {
+		return fmt.Errorf("create asset record: %w", err)
+	}
+	if fresh {
+		rb.assetIDs = append(rb.assetIDs, newAsset.ID)
+	}
+	return nil
+}
+
+// withoutSideFiles drops the format's index and checksum files
+// (base.IsPublishSideFile) from assets.
+func withoutSideFiles(format domain.RepoFormat, assets []domain.Asset) []domain.Asset {
+	out := assets[:0:0]
+	for _, a := range assets {
+		if !base.IsPublishSideFile(format, a.Path) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// unitAssets flattens every unit's assets: the full set a promotion writes.
+func unitAssets(units []promotionUnit) []domain.Asset {
+	var out []domain.Asset
+	for _, u := range units {
+		out = append(out, u.assets...)
+	}
+	return out
+}
+
+// checkTargetWritePolicy applies the target repository's write policy (#539)
+// to every asset a promotion is about to copy, before the first byte moves, so
+// a refused promotion leaves nothing half-copied: a read-only target refuses
+// outright, a disable-redeploy one refuses when any non-exempt path is already
+// taken there. Exempt paths (base.RedeployExempt) are digest-addressed OCI
+// blobs and manifests, "latest" with allow_redeploy_latest, maven-metadata.xml
+// and SNAPSHOTs — so an image whose layers the target already holds still
+// promotes, and those identical units are then skipped by missingInTarget.
+// The answer maps each path to whether its copy must hold the path lock
+// (withTargetPathLock).
+func (s *PromotionService) checkTargetWritePolicy(ctx context.Context, toRepo *domain.Repository, assets []domain.Asset) (map[string]bool, error) {
+	guarded := make(map[string]bool, len(assets))
+	for _, asset := range assets {
+		g, err := base.CheckWritePolicy(ctx, s.assetRepo, toRepo, asset.Path)
+		if err != nil {
+			return nil, fmt.Errorf("promote %s to %s: %w", asset.Path, toRepo.Name, err)
+		}
+		guarded[asset.Path] = g
+	}
+	return guarded, nil
+}
+
+// targetPolicyGate is the Promote-time form of checkTargetWritePolicy: a
+// promotion the target's write policy would refuse is refused before a
+// request row is filed, the way #541 refuses an incomplete image. Approve
+// checks again at copy time, since the target can change in between.
+func (s *PromotionService) targetPolicyGate(ctx context.Context, rule *domain.PromotionRule, comp *domain.Component) error {
+	toRepo, _ := s.repoRepo.Get(ctx, rule.ToRepo)
+	if toRepo == nil {
+		// Not this gate's call: a missing target fails at copy time, as it
+		// did before the write policy existed.
+		return nil
+	}
+	if domain.RepoWritePolicy(toRepo) == domain.WritePolicyAllow {
+		return nil
+	}
+	assets, err := s.assetRepo.ListByComponentID(ctx, comp.ID)
+	if err != nil {
+		return fmt.Errorf("list assets: %w", err)
+	}
+	dependents, err := s.expandImage(ctx, comp, assets)
+	if err != nil {
+		return err
+	}
+	units := append([]promotionUnit{{comp: comp, assets: assets}}, dependents...)
+	_, err = s.checkTargetWritePolicy(ctx, toRepo, unitAssets(units))
+	return err
+}
+
+// withTargetPathLock runs one asset's copy under the target path's blob-key
+// lock when the write policy guards that path — the same lock a client push
+// of the path takes in base.StoreArtifact, so a promotion and a push cannot
+// both claim a fresh path.
+func (s *PromotionService) withTargetPathLock(ctx context.Context, guarded bool, blobKey string, copyOne func(context.Context) error) error {
+	if !guarded {
+		return copyOne(ctx)
+	}
+	return s.assetRepo.WithBlobKeyLock(ctx, blobKey, copyOne)
+}
+
+// promotedExtra is the source component's metadata as the promoted copy should
+// carry it. The keys describe the content, and the copy is that content byte for
+// byte, so they stay true in the target repository. The OCI ones have to travel
+// in particular: a signature manifest is found through Extra["oci_subject"], so
+// a copy without it is a signature the target repository's referrers API can
+// never list.
+//
+// domain.ListingExtraKeys stay behind too: they say where the component is
+// listed in the source repository (apt suites), which is no fact about the
+// content.
+//
+// scan_result is the other key left behind. It records a scan run against the
+// SOURCE repository's image reference, and the scan rows the promotion gate
+// actually reads are keyed by component ID and are not copied either — so
+// carrying it would report a scan of this copy that was never run.
+//
+// The result is never nil: the copy replaces whatever metadata the target's
+// component held, and a nil Extra would keep it (#668).
+func promotedExtra(extra map[string]any) map[string]any {
+	out := make(map[string]any, len(extra))
+	for k, v := range extra {
+		if k == "scan_result" || slices.Contains(domain.ListingExtraKeys, k) {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// resolveStore returns the physical BlobStore for a given blobStoreID
+// pointer, and the id to record on the copied assets.
+//
+// Both branches resolve the physical store from the DB row, the way every
+// other data path does: in a stock local deployment the seeded default row's
+// store lives under its own subdirectory, not at the process store's root, so
+// answering the implicit-default case with the injected default instance
+// would write the copied blobs where no download will ever look for them.
+// The id is never empty — assets.blob_store_id is a NOT NULL foreign key,
+// and the old empty-string answer made every promotion touching a
+// default-store repository fail with a raw constraint error (#256).
+func (s *PromotionService) resolveStore(ctx context.Context, blobStoreID *string) (storage.BlobStore, string, error) {
+	implicit := blobStoreID == nil || *blobStoreID == ""
+	var bsMeta *domain.BlobStore
+	var err error
+	if implicit {
+		bsMeta, err = repository.DefaultBlobStore(ctx, s.blobRepo)
+		if err != nil {
+			return nil, "", err
+		}
+	} else {
+		bsMeta, err = s.blobRepo.GetByID(ctx, *blobStoreID)
+		if errors.Is(err, repository.ErrNotFound) || (err == nil && bsMeta == nil) {
+			return nil, "", fmt.Errorf("blob store id %q not found", *blobStoreID)
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("blob store: %w", err)
+		}
+	}
+	bs, err := s.blobResolver.Get(ctx, storage.BlobStoreDescriptor{
+		ID:     bsMeta.ID,
+		Type:   bsMeta.Type,
+		Config: bsMeta.Config,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("blob store %q: %w", bsMeta.Name, err)
+	}
+	return bs, bsMeta.ID, nil
+}

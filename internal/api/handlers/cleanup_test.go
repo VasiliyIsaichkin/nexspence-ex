@@ -1,0 +1,392 @@
+package handlers_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/nexspence-oss/nexspence/internal/api/handlers"
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/service"
+	"github.com/nexspence-oss/nexspence/internal/testutil"
+)
+
+func cleanupNopLog() *zap.SugaredLogger { return zap.NewNop().Sugar() }
+
+// mountCleanup wires the real CleanupService (over mocks) as the runner so Preview / Run
+// exercise the actual service path, mirroring router.go.
+func mountCleanup(t *testing.T) (*gin.Engine, *testutil.CleanupPolicyRepo, *testutil.RepoRepo, *testutil.AssetRepo) {
+	return mountCleanupWithLog(t, cleanupNopLog())
+}
+
+// mountCleanupWithLog is mountCleanup with a caller-chosen handler logger, so
+// tests can observe what the handler logs.
+func mountCleanupWithLog(t *testing.T, log *zap.SugaredLogger) (*gin.Engine, *testutil.CleanupPolicyRepo, *testutil.RepoRepo, *testutil.AssetRepo) {
+	t.Helper()
+	policies := testutil.NewCleanupPolicyRepo()
+	repos := testutil.NewRepoRepo()
+	assets := testutil.NewAssetRepo()
+	blobRepo := testutil.NewBlobStoreRepo()
+	blobs := testutil.NewBlobStore()
+	svc := service.NewCleanupService(policies, repos, assets, blobRepo, blobs, cleanupNopLog())
+	h := handlers.NewCleanupHandler(policies, repos, svc, log)
+
+	r := gin.New()
+	r.GET("/service/rest/v1/cleanup-policies", h.List)
+	r.GET("/service/rest/v1/cleanup-policies/:id", h.Get)
+	r.POST("/service/rest/v1/cleanup-policies", h.Create)
+	r.PUT("/service/rest/v1/cleanup-policies/:id", h.Update)
+	r.DELETE("/service/rest/v1/cleanup-policies/:id", h.Delete)
+	r.POST("/service/rest/v1/cleanup-policies/:id/run", h.Run)
+	r.POST("/api/v1/cleanup-policies/:id/preview", h.Preview)
+	return r, policies, repos, assets
+}
+
+// ── List ──────────────────────────────────────────────────────────────────────
+
+func TestCleanupHandler_List_Empty(t *testing.T) {
+	r, _, _, _ := mountCleanup(t)
+	rec := do(t, r, http.MethodGet, "/service/rest/v1/cleanup-policies", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got []domain.CleanupPolicy
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Empty(t, got)
+}
+
+func TestCleanupHandler_List_RepoError_500(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	policies.Err = errors.New("db down")
+	rec := do(t, r, http.MethodGet, "/service/rest/v1/cleanup-policies", nil)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// ── Get ───────────────────────────────────────────────────────────────────────
+
+func TestCleanupHandler_Get_OK(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	p := &domain.CleanupPolicy{Name: "p", Format: "*", Criteria: map[string]any{}}
+	require.NoError(t, policies.Create(testContext(), p))
+	rec := do(t, r, http.MethodGet, "/service/rest/v1/cleanup-policies/"+p.ID, nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got domain.CleanupPolicy
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, "p", got.Name)
+}
+
+func TestCleanupHandler_Get_NotFound_404(t *testing.T) {
+	r, _, _, _ := mountCleanup(t)
+	rec := do(t, r, http.MethodGet, "/service/rest/v1/cleanup-policies/ghost", nil)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestCleanupHandler_Get_RepoError_500(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	policies.Err = errors.New("db down")
+	rec := do(t, r, http.MethodGet, "/service/rest/v1/cleanup-policies/any", nil)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// ── Create ────────────────────────────────────────────────────────────────────
+
+func TestCleanupHandler_Create_OK_DefaultsFormatAndCriteria(t *testing.T) {
+	r, _, _, _ := mountCleanup(t)
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/cleanup-policies",
+		map[string]any{"name": "keep-recent", "retainNVersions": 3})
+	require.Equal(t, http.StatusCreated, rec.Code)
+	var got domain.CleanupPolicy
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, "keep-recent", got.Name)
+	assert.Equal(t, "*", got.Format)        // defaulted
+	assert.NotNil(t, got.Criteria)          // defaulted to {}
+	assert.Equal(t, 3, got.RetainNVersions) // persisted
+	assert.NotEmpty(t, got.ID)
+}
+
+func TestCleanupHandler_Create_BadJSON_400(t *testing.T) {
+	r, _, _, _ := mountCleanup(t)
+	rec := doRaw(t, r, http.MethodPost, "/service/rest/v1/cleanup-policies", []byte(`{bad`))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestCleanupHandler_Create_EmptyName_400(t *testing.T) {
+	r, _, _, _ := mountCleanup(t)
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/cleanup-policies",
+		map[string]any{"format": "maven2"})
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestCleanupHandler_Create_RepoError_500(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	policies.Err = errors.New("db down")
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/cleanup-policies",
+		map[string]any{"name": "fail"})
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// ── Update ────────────────────────────────────────────────────────────────────
+
+func TestCleanupHandler_Update_OK(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	p := &domain.CleanupPolicy{Name: "old", Format: "*", Criteria: map[string]any{}}
+	require.NoError(t, policies.Create(testContext(), p))
+	rec := do(t, r, http.MethodPut, "/service/rest/v1/cleanup-policies/"+p.ID,
+		map[string]any{"name": "new", "format": "npm", "retainNVersions": 5})
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got domain.CleanupPolicy
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, p.ID, got.ID) // ID forced from path param
+	assert.Equal(t, "new", got.Name)
+	assert.Equal(t, 5, got.RetainNVersions)
+}
+
+func TestCleanupHandler_Update_BadJSON_400(t *testing.T) {
+	r, _, _, _ := mountCleanup(t)
+	rec := doRaw(t, r, http.MethodPut, "/service/rest/v1/cleanup-policies/any", []byte(`{bad`))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestCleanupHandler_Update_RepoError_500(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	policies.Err = errors.New("db down")
+	rec := do(t, r, http.MethodPut, "/service/rest/v1/cleanup-policies/any",
+		map[string]any{"name": "x"})
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// ── Delete ────────────────────────────────────────────────────────────────────
+
+func TestCleanupHandler_Delete_OK(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	p := &domain.CleanupPolicy{Name: "temp", Format: "*", Criteria: map[string]any{}}
+	require.NoError(t, policies.Create(testContext(), p))
+	rec := do(t, r, http.MethodDelete, "/service/rest/v1/cleanup-policies/"+p.ID, nil)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	got, _ := policies.Get(testContext(), p.ID)
+	assert.Nil(t, got)
+}
+
+func TestCleanupHandler_Delete_DetachError_500(t *testing.T) {
+	r, _, repos, _ := mountCleanup(t)
+	repos.Err = errors.New("detach failed")
+	rec := do(t, r, http.MethodDelete, "/service/rest/v1/cleanup-policies/any", nil)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+func TestCleanupHandler_Delete_DeleteError_500(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	// Detach succeeds (repos.Err nil), policy Delete fails.
+	policies.Err = errors.New("delete failed")
+	rec := do(t, r, http.MethodDelete, "/service/rest/v1/cleanup-policies/any", nil)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// A failure in the second half of the two-step delete leaves repositories
+// already detached while the policy row survives; the response has to say so —
+// a generic 500 reads as "nothing happened" and hides that a retry finishes
+// the job.
+func TestCleanupHandler_Delete_DeleteError_SaysReposWereDetached(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	policies.Err = errors.New("db connection lost")
+	rec := do(t, r, http.MethodDelete, "/service/rest/v1/cleanup-policies/p1", nil)
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Contains(t, rec.Body.String(), "detached",
+		"the client must learn the repositories are already detached")
+	assert.Contains(t, rec.Body.String(), "retry",
+		"the client must learn a retry completes the deletion")
+}
+
+// ── Run ───────────────────────────────────────────────────────────────────────
+
+// A single-policy run is synchronous and returns the run summary. A policy not
+// attached to any repository reports a skip with a reason (issue #62: "manual
+// execution produces no results" — now the reason is surfaced).
+func TestCleanupHandler_Run_Single_Unattached_ReportsSkip(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	p := &domain.CleanupPolicy{
+		Name: "run-me", Format: "*", Enabled: true,
+		Criteria: map[string]any{"artifactAgeDays": 30},
+	}
+	require.NoError(t, policies.Create(testContext(), p))
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/cleanup-policies/"+p.ID+"/run", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var res domain.CleanupRunResult
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &res))
+	assert.True(t, res.Skipped)
+	assert.Contains(t, res.SkippedReason, "not attached")
+}
+
+// A single-policy run that deletes assets returns counts.
+func TestCleanupHandler_Run_Single_ReportsCounts(t *testing.T) {
+	r, policies, repos, assets := mountCleanup(t)
+	p := &domain.CleanupPolicy{
+		Name: "clear", Format: "*", Enabled: true, Criteria: map[string]any{},
+	}
+	require.NoError(t, policies.Create(testContext(), p))
+	require.NoError(t, repos.Create(testContext(), &domain.Repository{
+		Name: "debian", ID: "r1", Format: domain.FormatApt, CleanupPolicyIDs: []string{p.ID},
+	}))
+	assets.Stale = []domain.Asset{{ID: "a1", BlobKey: "bk1", SizeBytes: 42, Path: "/x"}}
+
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/cleanup-policies/"+p.ID+"/run", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var res domain.CleanupRunResult
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &res))
+	assert.False(t, res.Skipped)
+	assert.Equal(t, 1, res.Deleted)
+	assert.Equal(t, int64(42), res.FreedBytes)
+}
+
+// ctxRecordingRunner is a cleanup runner that records whether the context it
+// was handed was already canceled.
+type ctxRecordingRunner struct {
+	ran    int
+	ctxErr error
+}
+
+func (f *ctxRecordingRunner) RunPolicy(context.Context, string) error { return nil }
+func (f *ctxRecordingRunner) RunPolicyResult(ctx context.Context, id string) (*domain.CleanupRunResult, error) {
+	f.ran++
+	f.ctxErr = ctx.Err()
+	return &domain.CleanupRunResult{PolicyID: id}, nil
+}
+func (f *ctxRecordingRunner) RunAll(context.Context) error         { return nil }
+func (f *ctxRecordingRunner) ReloadPolicy(context.Context, string) {}
+func (f *ctxRecordingRunner) PreviewPolicy(context.Context, string) (*domain.CleanupPreviewResult, error) {
+	return &domain.CleanupPreviewResult{}, nil
+}
+
+// A client that gives up on the synchronous single-policy run must not cut the
+// run short: a cut run in HA would also strand its policy lock (#573).
+func TestCleanupHandler_Run_Single_NotCanceledWithClient(t *testing.T) {
+	runner := &ctxRecordingRunner{}
+	h := handlers.NewCleanupHandler(testutil.NewCleanupPolicyRepo(), testutil.NewRepoRepo(), runner, cleanupNopLog())
+	r := gin.New()
+	r.POST("/service/rest/v1/cleanup-policies/:id/run", h.Run)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/service/rest/v1/cleanup-policies/p1/run", nil).WithContext(ctx)
+	r.ServeHTTP(httptest.NewRecorder(), req)
+
+	require.Equal(t, 1, runner.ran)
+	assert.NoError(t, runner.ctxErr, "the run must not see the client's cancellation")
+}
+
+func TestCleanupHandler_Run_All_202(t *testing.T) {
+	r, _, _, _ := mountCleanup(t)
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/cleanup-policies/_all/run", nil)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	assert.Equal(t, "running all policies", body["status"])
+}
+
+// The client already got its 202, so a background RunAll failure (an
+// unreachable lock backend, a dead DB) is invisible unless it is logged.
+func TestCleanupHandler_Run_All_BackgroundFailureIsLogged(t *testing.T) {
+	core, logs := observer.New(zap.ErrorLevel)
+	r, policies, _, _ := mountCleanupWithLog(t, zap.New(core).Sugar())
+	policies.Err = errors.New("lock backend unreachable")
+
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/cleanup-policies/_all/run", nil)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for logs.Len() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	require.NotZero(t, logs.Len(), "a failed background run-all must be logged, not discarded")
+	assert.Contains(t, logs.All()[0].Message, "run",
+		"the log entry names the failed operation")
+}
+
+// ── Preview ───────────────────────────────────────────────────────────────────
+
+func TestCleanupHandler_Preview_OK(t *testing.T) {
+	r, policies, repos, assets := mountCleanup(t)
+	// Attach the policy to a repo so PreviewPolicy resolves repo names, then seed stale assets.
+	repoName := "maven-hosted"
+	p := &domain.CleanupPolicy{
+		Name: "preview-me", Format: "*",
+		Criteria: map[string]any{"artifactAgeDays": 90},
+	}
+	require.NoError(t, policies.Create(testContext(), p))
+	require.NoError(t, repos.Create(testContext(), &domain.Repository{
+		Name: repoName, Format: "maven2", CleanupPolicyIDs: []string{p.ID},
+	}))
+	assets.Stale = []domain.Asset{
+		{ID: "a1", Path: "com/x/1.0/x.jar", Repository: repoName, SizeBytes: 100},
+		{ID: "a2", Path: "com/x/2.0/x.jar", Repository: repoName, SizeBytes: 200},
+	}
+
+	rec := do(t, r, http.MethodPost, "/api/v1/cleanup-policies/"+p.ID+"/preview", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var res domain.CleanupPreviewResult
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &res))
+	assert.Equal(t, 2, res.TotalCount)
+	assert.Equal(t, int64(300), res.TotalBytes)
+	require.Len(t, res.Assets, 2)
+	assert.Equal(t, "age 90d", res.Assets[0].Reason)
+}
+
+func TestCleanupHandler_Preview_NotFound_500(t *testing.T) {
+	// PreviewPolicy returns an error for a missing policy → handler maps to 500.
+	r, _, _, _ := mountCleanup(t)
+	rec := do(t, r, http.MethodPost, "/api/v1/cleanup-policies/ghost/preview", nil)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// Update must apply the same input contract as Create: a blank name is rejected
+// and a missing format defaults to "*", instead of silently blanking the policy.
+func TestCleanupHandler_Update_EmptyName_400(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	p := &domain.CleanupPolicy{Name: "keep-me", Format: "*", Criteria: map[string]any{}}
+	require.NoError(t, policies.Create(testContext(), p))
+
+	rec := do(t, r, http.MethodPut, "/service/rest/v1/cleanup-policies/"+p.ID,
+		map[string]any{"name": "", "format": "maven2"})
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	stored, err := policies.Get(testContext(), p.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "keep-me", stored.Name)
+}
+
+func TestCleanupHandler_Update_DefaultsFormat(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	p := &domain.CleanupPolicy{Name: "old", Format: "npm", Criteria: map[string]any{}}
+	require.NoError(t, policies.Create(testContext(), p))
+
+	rec := do(t, r, http.MethodPut, "/service/rest/v1/cleanup-policies/"+p.ID,
+		map[string]any{"name": "new"})
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got domain.CleanupPolicy
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, "*", got.Format)
+	assert.NotNil(t, got.Criteria)
+}
+
+// An unparseable schedule would be dropped by the scheduler with only a log
+// line, so both write paths reject it up front.
+func TestCleanupHandler_InvalidScheduleCron_400(t *testing.T) {
+	r, policies, _, _ := mountCleanup(t)
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/cleanup-policies",
+		map[string]any{"name": "p", "scheduleCron": "not-a-cron"})
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+
+	p := &domain.CleanupPolicy{Name: "p", Format: "*", Criteria: map[string]any{}}
+	require.NoError(t, policies.Create(testContext(), p))
+	rec = do(t, r, http.MethodPut, "/service/rest/v1/cleanup-policies/"+p.ID,
+		map[string]any{"name": "p", "scheduleCron": "not-a-cron"})
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}

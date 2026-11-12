@@ -1,0 +1,1293 @@
+package repoproxy_test
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/formats"
+	"github.com/nexspence-oss/nexspence/internal/formats/base"
+	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
+	"github.com/nexspence-oss/nexspence/internal/testutil"
+)
+
+// ── stubDispatcher ───────────────────────────────────────────────────────────
+
+type stubDispatcher struct {
+	events []domain.WebhookPayload
+}
+
+func (s *stubDispatcher) Dispatch(p domain.WebhookPayload) {
+	s.events = append(s.events, p)
+}
+
+// ── helper ───────────────────────────────────────────────────────────────────
+
+func makeDeps(repo *domain.Repository) formats.Deps {
+	return formats.Deps{
+		Repos:      testutil.NewRepoRepo(repo),
+		Blobs:      testutil.NewBlobStoreRepo(),
+		Components: testutil.NewComponentRepo(),
+		Assets:     testutil.NewAssetRepo(),
+		BlobStore:  testutil.NewBlobStore(),
+	}
+}
+
+// ── RejectMutation edge cases ────────────────────────────────────────────────
+
+func TestRejectMutation_NilRepo(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPut, "/", nil)
+	assert.False(t, repoproxy.RejectMutation(c, nil))
+}
+
+func TestRejectMutation_ProxyGET(t *testing.T) {
+	repo := proxyRepo("p", "https://example.com")
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	assert.False(t, repoproxy.RejectMutation(c, repo))
+}
+
+func TestRejectMutation_ProxyPOST(t *testing.T) {
+	repo := proxyRepo("p", "https://example.com")
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+	assert.True(t, repoproxy.RejectMutation(c, repo))
+	assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
+}
+
+func TestRejectMutation_ProxyPATCH(t *testing.T) {
+	repo := proxyRepo("p", "https://example.com")
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/", nil)
+	assert.True(t, repoproxy.RejectMutation(c, repo))
+}
+
+func TestRejectMutation_ProxyDELETE(t *testing.T) {
+	repo := proxyRepo("p", "https://example.com")
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodDelete, "/", nil)
+	assert.True(t, repoproxy.RejectMutation(c, repo))
+}
+
+// ── RemoteURL ────────────────────────────────────────────────────────────────
+
+func TestRemoteURL_NilProxyConfig(t *testing.T) {
+	repo := &domain.Repository{Type: domain.TypeProxy, ProxyConfig: nil}
+	_, err := repoproxy.RemoteURL(repo)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote_url")
+}
+
+func TestRemoteURL_MissingKey(t *testing.T) {
+	repo := &domain.Repository{Type: domain.TypeProxy, ProxyConfig: map[string]any{}}
+	_, err := repoproxy.RemoteURL(repo)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote_url")
+}
+
+func TestRemoteURL_EmptyString(t *testing.T) {
+	repo := &domain.Repository{
+		Type:        domain.TypeProxy,
+		ProxyConfig: map[string]any{"remote_url": "   "},
+	}
+	_, err := repoproxy.RemoteURL(repo)
+	require.Error(t, err)
+}
+
+func TestRemoteURL_NonStringValue(t *testing.T) {
+	repo := &domain.Repository{
+		Type:        domain.TypeProxy,
+		ProxyConfig: map[string]any{"remote_url": 12345},
+	}
+	_, err := repoproxy.RemoteURL(repo)
+	require.Error(t, err)
+}
+
+func TestRemoteURL_Valid_StripsTrailingSlash(t *testing.T) {
+	repo := &domain.Repository{
+		Type:        domain.TypeProxy,
+		ProxyConfig: map[string]any{"remote_url": "https://repo.example.com/"},
+	}
+	got, err := repoproxy.RemoteURL(repo)
+	require.NoError(t, err)
+	assert.Equal(t, "https://repo.example.com", got)
+}
+
+// ── JoinURL edge cases ────────────────────────────────────────────────────────
+
+func TestJoinURL_InvalidBase(t *testing.T) {
+	_, err := repoproxy.JoinURL("://bad-url", "/path")
+	require.Error(t, err)
+}
+
+// ── NPMMetadataPath ──────────────────────────────────────────────────────────
+
+func TestNPMMetadataPath_Simple(t *testing.T) {
+	assert.Equal(t, "lodash", repoproxy.NPMMetadataPath("lodash"))
+	assert.Equal(t, "lodash", repoproxy.NPMMetadataPath("/lodash"))
+	assert.Equal(t, "lodash", repoproxy.NPMMetadataPath("/lodash/"))
+}
+
+func TestNPMMetadataPath_Scoped(t *testing.T) {
+	assert.Equal(t, "@babel%2Fcore", repoproxy.NPMMetadataPath("@babel/core"))
+	assert.Equal(t, "@types%2Fnode", repoproxy.NPMMetadataPath("/@types/node"))
+}
+
+func TestNPMMetadataPath_ScopedNoSlash(t *testing.T) {
+	// @scope with no slash — returned as-is (no slash found after @)
+	assert.Equal(t, "@noscope", repoproxy.NPMMetadataPath("@noscope"))
+}
+
+// ── ServeGET error paths ─────────────────────────────────────────────────────
+
+func TestServeGET_NotProxy(t *testing.T) {
+	repo := &domain.Repository{
+		ID: "h1", Name: "hosted1", Format: "raw", Type: domain.TypeHosted,
+	}
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/file", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/file", "", base.Coords{}, "", 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a proxy")
+}
+
+func TestServeGET_UnsupportedMethod(t *testing.T) {
+	repo := proxyRepo("p", "https://example.com")
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/file", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/file", "", base.Coords{}, "", 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported method")
+}
+
+func TestServeGET_MissingRemoteURL(t *testing.T) {
+	repo := &domain.Repository{
+		ID: "p1", Name: "pnorurl", Format: "raw", Type: domain.TypeProxy,
+		ProxyConfig: nil,
+	}
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/file", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/file", "", base.Coords{}, "", 0)
+	require.NoError(t, err) // handled internally with 400
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestServeGET_Upstream404(t *testing.T) {
+	useUnguardedUpstream(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = fmt.Fprint(w, "not found")
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("p404", upstream.URL)
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/missing.jar", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/missing.jar", "", base.Coords{}, "", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestServeGET_UpstreamError(t *testing.T) {
+	// Use a server that immediately closes the connection.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Force a TCP-level rejection by hijacking and closing.
+		h, ok := w.(http.Hijacker)
+		if !ok {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		conn, _, _ := h.Hijack()
+		_ = conn.Close()
+	}))
+	defer srv.Close()
+
+	repo := proxyRepo("perr", srv.URL)
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/file.bin", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/file.bin", "", base.Coords{}, "", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusBadGateway, w.Code)
+}
+
+func TestServeGET_UpstreamError_FiresWebhook(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		h, ok := w.(http.Hijacker)
+		if !ok {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		conn, _, _ := h.Hijack()
+		_ = conn.Close()
+	}))
+	defer srv.Close()
+
+	repo := proxyRepo("pwh", srv.URL)
+	disp := &stubDispatcher{}
+	d := makeDeps(repo)
+	d.Webhooks = disp
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/file.bin", nil)
+	_ = repoproxy.ServeGET(c, d, repo, "/file.bin", "", base.Coords{}, "", 0)
+
+	// Give the goroutine a moment — Dispatch is synchronous in stubDispatcher but
+	// ServeGET calls it directly (not in a goroutine), so no wait needed.
+	assert.Equal(t, http.StatusBadGateway, w.Code)
+	// Webhook may be fired after the handler returns (async dispatch in production);
+	// stubDispatcher is synchronous, so it should be populated immediately.
+	require.Len(t, disp.events, 1)
+	assert.Equal(t, domain.EventProxyError, disp.events[0].Event)
+}
+
+func TestServeGET_UpstreamNotModified(t *testing.T) {
+	useUnguardedUpstream(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("ETag", `"abc123"`)
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("pnm", upstream.URL)
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req := httptest.NewRequest(http.MethodGet, "/file", nil)
+	req.Header.Set("If-None-Match", `"abc123"`)
+	c.Request = req
+	err := repoproxy.ServeGET(c, d, repo, "/file", "", base.Coords{}, "", 0)
+	require.NoError(t, err)
+	// gin's c.Status() flushes the code only on first write; 304 has no body so we
+	// check via the writer's status (gin exposes it on the response writer).
+	assert.Equal(t, http.StatusNotModified, c.Writer.Status())
+}
+
+func TestServeGET_HEAD_CacheHit(t *testing.T) {
+	repo := proxyRepo("headcache", "https://upstream.example.com")
+	blobStore := testutil.NewBlobStore()
+	assets := testutil.NewAssetRepo()
+	content := "some cached data"
+	key := "head-cache-key"
+	_ = blobStore.Put(context.TODO(), key, strings.NewReader(content), int64(len(content)))
+	a := &domain.Asset{
+		Repository:   repo.Name,
+		RepositoryID: repo.ID,
+		Path:         "/data.bin",
+		BlobKey:      key,
+		ContentType:  "application/octet-stream",
+		SizeBytes:    int64(len(content)),
+	}
+	_ = assets.Create(context.TODO(), a)
+
+	d := formats.Deps{
+		Repos:      testutil.NewRepoRepo(repo),
+		Blobs:      testutil.NewBlobStoreRepo(),
+		Components: testutil.NewComponentRepo(),
+		Assets:     assets,
+		BlobStore:  blobStore,
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodHead, "/data.bin", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/data.bin", "", base.Coords{}, "application/octet-stream", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "", w.Body.String()) // HEAD has no body
+	assert.Equal(t, "application/octet-stream", w.Header().Get("Content-Type"))
+}
+
+func TestServeGET_HEAD_CacheMiss_FetchesUpstream(t *testing.T) {
+	useUnguardedUpstream(t)
+	const body = "upstream content for head"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, body)
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("headmiss", upstream.URL)
+	d := makeDeps(repo)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodHead, "/headfile.txt", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/headfile.txt", "", base.Coords{Name: "headfile.txt"}, "text/plain", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestServeGET_DefaultContentType(t *testing.T) {
+	useUnguardedUpstream(t)
+	// Upstream returns no Content-Type; defaultContentType should be used.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Explicitly clear Content-Type so Go doesn't auto-detect
+		w.Header()["Content-Type"] = nil
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "raw bytes")
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("pdefct", upstream.URL)
+	d := makeDeps(repo)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/data", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/data", "", base.Coords{Name: "data"}, "application/octet-stream", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "application/octet-stream", w.Header().Get("Content-Type"))
+}
+
+func TestServeGET_UpstreamPathOverride(t *testing.T) {
+	useUnguardedUpstream(t)
+	// When upstreamPath is set, that path should be fetched but cache key uses repoRelativePath.
+	const body = "scoped npm meta"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Should be called with the upstream path, not the repo-relative path —
+		// and escaped exactly once on the wire. The old assertion checked
+		// r.URL.Path (the DECODED path) against "/@babel%2Fcore", which only
+		// held while the wire carried the double-escaped "/@babel%252Fcore" —
+		// the very bug that made registry.npmjs.org answer 405 for every
+		// scoped package.
+		assert.Equal(t, "/@babel%2Fcore", r.RequestURI)
+		assert.Equal(t, "/@babel/core", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, body)
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("npmp", upstream.URL)
+	d := makeDeps(repo)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/@babel/core", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/@babel/core", "/@babel%2Fcore", base.Coords{Name: "@babel/core"}, "application/json", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, body, w.Body.String())
+}
+
+func TestServeGET_Accept_Header_Forwarded(t *testing.T) {
+	useUnguardedUpstream(t)
+	var capturedAccept string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAccept = r.Header.Get("Accept")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("pacct", upstream.URL)
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req := httptest.NewRequest(http.MethodGet, "/file", nil)
+	req.Header.Set("Accept", "application/vnd.npm.install-v1+json")
+	c.Request = req
+	err := repoproxy.ServeGET(c, d, repo, "/file", "", base.Coords{Name: "file"}, "", 0)
+	require.NoError(t, err)
+	assert.Equal(t, "application/vnd.npm.install-v1+json", capturedAccept)
+}
+
+// ── docker_registry_token.go — unit tests ────────────────────────────────────
+
+// fetchUpstreamWithDockerHubAuth is not exported; we drive it indirectly via
+// ServeGET with a fake upstream that mimics Docker Hub 401 → token → 200 flow.
+
+func TestServeGET_DockerHubLike_401_Token_200(t *testing.T) {
+	// Phase 1: serve a 401 with WWW-Authenticate Bearer challenge pointing to the token server.
+	// Phase 2 (token server): return a valid token JSON.
+	// Phase 3: second request with Authorization: Bearer <token> → 200.
+	calls := 0
+
+	// Token server: must be started separately.
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := r.URL.Query().Get("scope")
+		assert.NotEmpty(t, scope)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": "test-bearer-token"})
+	}))
+	defer tokenServer.Close()
+
+	// Upstream Docker registry.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Header.Get("Authorization") == "" {
+			// First call: challenge with Bearer realm pointing to our token server.
+			challenge := fmt.Sprintf(
+				`Bearer realm="%s/token",service="registry.test.io",scope="repository:library/alpine:pull"`,
+				tokenServer.URL,
+			)
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		// Second call: authorized → return 200.
+		assert.Equal(t, "Bearer test-bearer-token", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, `{"schemaVersion":2}`)
+	}))
+	defer upstream.Close()
+
+	// Build a repo whose remote_url looks like Docker Hub so isDockerRegistryRemote is true.
+	// We point remote_url to our upstream but override UpstreamClient to avoid real DNS.
+	// Since we can't easily override isDockerRegistryRemote without touching source, we build
+	// an approach: we use a custom transport that maps "registry-1.docker.io" → upstream.
+	origClient := repoproxy.UpstreamClient
+
+	transport := &proxyRoundTripper{
+		upstreamHost: upstream.URL,
+		tokenHost:    tokenServer.URL,
+	}
+	repoproxy.UpstreamClient = &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: transport,
+	}
+	defer func() { repoproxy.UpstreamClient = origClient }()
+
+	// Repo with remote_url = Docker Hub (so isDockerRegistryRemote returns true).
+	repo := proxyRepo("dockerhub", "https://registry-1.docker.io")
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v2/library/alpine/manifests/latest", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/v2/library/alpine/manifests/latest", "", base.Coords{Name: "alpine"}, "application/json", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.GreaterOrEqual(t, calls, 2, "should have made at least 2 upstream calls (401 + retry)")
+}
+
+// A public GHCR package answers the first request with 401 and a Bearer
+// challenge. The proxy has to take that anonymous token itself: the client is
+// talking to Nexspence, not to ghcr.io.
+func TestServeGET_GHCRLike_401_Token_200(t *testing.T) {
+	useUnguardedUpstream(t)
+
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "repository:fallen-up/charts/nexspence:pull", r.URL.Query().Get("scope"))
+		assert.Equal(t, "ghcr.io", r.URL.Query().Get("service"))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": "ghcr-anon"})
+	}))
+	defer tokenServer.Close()
+
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+				`Bearer realm="%s",service="ghcr.io",scope="repository:fallen-up/charts/nexspence:pull"`,
+				tokenServer.URL,
+			))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		assert.Equal(t, "Bearer ghcr-anon", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		_, _ = fmt.Fprint(w, `{"schemaVersion":2}`)
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("ghcr", upstream.URL)
+	repo.Format = domain.FormatOCI
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v2/fallen-up/charts/nexspence/manifests/v2.9.0", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/v2/fallen-up/charts/nexspence/manifests/v2.9.0", "", base.Coords{Name: "nexspence"}, "application/json", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 2, calls)
+}
+
+// A Bearer realm on a non-registry format is the upstream's choice of URL.
+// Helm already fetches absolute origins through this function; following the
+// realm there is the foreign-host GET the credential rules exist to prevent.
+func TestServeGET_NonRegistryBearer401IsNotFollowed(t *testing.T) {
+	useUnguardedUpstream(t)
+
+	tokenHits := 0
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		tokenHits++
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, `{"token":"nope"}`)
+	}))
+	defer tokenServer.Close()
+
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+			`Bearer realm="%s",service="charts.example",scope="repository:widget:pull"`, tokenServer.URL))
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("no"))
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("helmcharts", upstream.URL)
+	repo.Format = domain.FormatHelm
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/widget-1.0.0.tgz", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/widget-1.0.0.tgz", "", base.Coords{Name: "widget"}, "", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, 0, tokenHits)
+}
+
+// remote_username stays on the registry host. A token realm on another
+// host:port and the retry that carries the token must not see it, even when
+// the registry answers the first request — the one that does send Basic —
+// with 401.
+func TestServeGET_OCIBearerRetryDoesNotSendBasic(t *testing.T) {
+	useUnguardedUpstream(t)
+
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(t, r.Header.Get("Authorization"))
+		assert.NotContains(t, r.URL.String(), "s3cret")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"token":"anon"}`)
+	}))
+	defer tokenServer.Close()
+
+	var sawBasic, sawBearer bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if u, p, ok := r.BasicAuth(); ok {
+			sawBasic = true
+			assert.Equal(t, "deploy", u)
+			assert.Equal(t, "s3cret", p)
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+				`Bearer realm="%s",service="ghcr.io",scope="repository:fallen-up/charts/nexspence:pull"`,
+				tokenServer.URL))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		assert.Equal(t, "Bearer anon", r.Header.Get("Authorization"))
+		assert.NotContains(t, r.Header.Get("Authorization"), "Basic")
+		sawBearer = true
+		_, _ = fmt.Fprint(w, `{"schemaVersion":2}`)
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("ghcr", upstream.URL)
+	repo.Format = domain.FormatOCI
+	repo.ProxyConfig["remote_username"] = "deploy"
+	repo.ProxyConfig["remote_password"] = "s3cret"
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v2/fallen-up/charts/nexspence/manifests/v1", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/v2/fallen-up/charts/nexspence/manifests/v1", "", base.Coords{Name: "nexspence"}, "", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, sawBasic, "first hop to the registry host still presents Basic")
+	assert.True(t, sawBearer, "retry presents the anonymous token, not Basic")
+}
+
+// A challenge that names a realm and omits service must not be filled in with
+// Docker Hub's service. That default belongs to Hub, which omits both.
+func TestServeGET_OCIBearerOmitsEmptyService(t *testing.T) {
+	useUnguardedUpstream(t)
+
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(t, r.URL.Query().Get("service"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"token":"anon"}`)
+	}))
+	defer tokenServer.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+				`Bearer realm="%s",scope="repository:fallen-up/charts/nexspence:pull"`, tokenServer.URL))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"schemaVersion":2}`)
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("ghcr", upstream.URL)
+	repo.Format = domain.FormatOCI
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v2/fallen-up/charts/nexspence/manifests/v1", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/v2/fallen-up/charts/nexspence/manifests/v1", "", base.Coords{Name: "nexspence"}, "", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// An https remote that challenges with an http realm does not get that URL
+// fetched, and the Bearer is not sent on a cleartext hop.
+func TestServeGET_OCIHttpRealmUnderHTTPSRemoteIsNotFetched(t *testing.T) {
+	tokenHits := 0
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		tokenHits++
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, `{"token":"cleartext"}`)
+	}))
+	defer tokenServer.Close()
+
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+			`Bearer realm="%s",service="ghcr.io",scope="repository:fallen-up/charts/nexspence:pull"`,
+			tokenServer.URL))
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("no"))
+	}))
+	defer upstream.Close()
+
+	upURL, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	orig := repoproxy.UpstreamClient
+	repoproxy.UpstreamClient = &http.Client{Transport: hostRewriteTransport{from: "ghcr.io", to: upURL}}
+	t.Cleanup(func() { repoproxy.UpstreamClient = orig })
+
+	repo := proxyRepo("ghcr", "https://ghcr.io")
+	repo.Format = domain.FormatOCI
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v2/fallen-up/charts/nexspence/manifests/v1", nil)
+	err = repoproxy.ServeGET(c, d, repo, "/v2/fallen-up/charts/nexspence/manifests/v1", "", base.Coords{Name: "nexspence"}, "", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, 0, tokenHits)
+}
+
+// acrLikeRegistry fakes a private Azure Container Registry: /v2/ answers 401
+// with a Bearer challenge whose realm is /oauth2/token on the registry's own
+// host, the token endpoint wants the repository's Basic credentials and
+// answers {"access_token":…}, and content needs that token. tokenAuth records
+// the Authorization each token request carried; the retry is served only on
+// an Authorization that is exactly the Bearer, so Basic beside it fails.
+type acrLikeRegistry struct {
+	srv          *httptest.Server
+	tokenAuth    []string
+	contentCalls int
+	sawBasicOnV2 bool
+}
+
+func newACRLikeRegistry(t *testing.T, user, pass string) *acrLikeRegistry {
+	t.Helper()
+	a := &acrLikeRegistry{}
+	a.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth2/token" {
+			a.tokenAuth = append(a.tokenAuth, r.Header.Get("Authorization"))
+			assert.Equal(t, "repository:team/app:pull", r.URL.Query().Get("scope"))
+			if u, p, ok := r.BasicAuth(); !ok || u != user || p != pass {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = fmt.Fprint(w, `{"errors":[{"code":"UNAUTHORIZED"}]}`)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"access_token":"acr-access"}`)
+			return
+		}
+		a.contentCalls++
+		if r.Header.Get("Authorization") == "Bearer acr-access" {
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = fmt.Fprint(w, `{"schemaVersion":2}`)
+			return
+		}
+		if _, _, ok := r.BasicAuth(); ok {
+			a.sawBasicOnV2 = true
+		}
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+			`Bearer realm="%s/oauth2/token",service="%s"`, a.srv.URL, a.srv.Listener.Addr().String()))
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = fmt.Fprint(w, `{"errors":[{"code":"UNAUTHORIZED"}]}`)
+	}))
+	t.Cleanup(a.srv.Close)
+	return a
+}
+
+func acrPull(t *testing.T, repo *domain.Repository) *httptest.ResponseRecorder {
+	t.Helper()
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v2/team/app/manifests/1.0", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/v2/team/app/manifests/1.0", "", base.Coords{Name: "team/app"}, "", 0)
+	require.NoError(t, err)
+	return w
+}
+
+// observeProxyLog routes repoproxy's warnings into an in-memory sink for the
+// duration of the test.
+func observeProxyLog(t *testing.T) *observer.ObservedLogs {
+	t.Helper()
+	core, logs := observer.New(zapcore.WarnLevel)
+	repoproxy.SetLogger(zap.New(core).Sugar())
+	t.Cleanup(func() { repoproxy.SetLogger(nil) })
+	return logs
+}
+
+// A private ACR refuses an anonymous token request. The realm is on
+// remote_url's host, so the token request presents remote_username, and the
+// retry presents the token alone.
+func TestServeGET_OCISameHostRealm_PresentsBasicToTokenEndpoint(t *testing.T) {
+	useUnguardedUpstream(t)
+	acr := newACRLikeRegistry(t, "puller", "s3cret")
+
+	repo := proxyRepo("acr", acr.srv.URL)
+	repo.Format = domain.FormatDocker
+	repo.ProxyConfig["remote_username"] = "puller"
+	repo.ProxyConfig["remote_password"] = "s3cret"
+
+	w := acrPull(t, repo)
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, acr.tokenAuth, 1)
+	assert.True(t, strings.HasPrefix(acr.tokenAuth[0], "Basic "), "token request carries Basic")
+	assert.Equal(t, 2, acr.contentCalls, "challenge, then the Bearer retry")
+	assert.True(t, acr.sawBasicOnV2, "the first hop to the registry still presents Basic")
+}
+
+// No remote_username: the token request on the registry host stays anonymous,
+// as it was for public GHCR and Hub pulls before same-host realms got Basic.
+func TestServeGET_OCISameHostRealm_NoUsernameStaysAnonymous(t *testing.T) {
+	useUnguardedUpstream(t)
+
+	var tokenAuth []string
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			tokenAuth = append(tokenAuth, r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"token":"anon"}`)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer anon" {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+				`Bearer realm="%s/token",service="ghcr.io",scope="repository:team/app:pull"`, srv.URL))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"schemaVersion":2}`)
+	}))
+	defer srv.Close()
+
+	repo := proxyRepo("ghcr", srv.URL)
+	repo.Format = domain.FormatOCI
+	repo.ProxyConfig["remote_password"] = "orphan-password"
+
+	w := acrPull(t, repo)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []string{""}, tokenAuth)
+}
+
+// The token endpoint refuses the credentials of a private registry. The one
+// anonymous token request is refused too, the anonymous content retry gets
+// 401, and the client sees that 401. Both refusals are logged — without the
+// password, the token or the scope query.
+func TestServeGET_OCITokenEndpointRefuses_WarnsAndFallsBack(t *testing.T) {
+	useUnguardedUpstream(t)
+	logs := observeProxyLog(t)
+	acr := newACRLikeRegistry(t, "puller", "right-password")
+
+	repo := proxyRepo("acr", acr.srv.URL)
+	repo.Format = domain.FormatDocker
+	repo.ProxyConfig["remote_username"] = "puller"
+	repo.ProxyConfig["remote_password"] = "wrong-password"
+
+	w := acrPull(t, repo)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Equal(t, 2, acr.contentCalls, "challenge, then the anonymous retry")
+	require.Len(t, acr.tokenAuth, 2, "the credentialed request, then exactly one anonymous one")
+	assert.True(t, strings.HasPrefix(acr.tokenAuth[0], "Basic "))
+	assert.Empty(t, acr.tokenAuth[1])
+
+	entries := logs.FilterMessageSnippet("token request failed").All()
+	require.Len(t, entries, 2)
+	for i, wantCreds := range []bool{true, false} {
+		fields := entries[i].ContextMap()
+		assert.Equal(t, "acr", fields["repository"])
+		assert.Equal(t, acr.srv.Listener.Addr().String(), fields["realm_host"])
+		assert.EqualValues(t, http.StatusUnauthorized, fields["status"])
+		assert.Equal(t, wantCreds, fields["with_credentials"])
+		logged := fmt.Sprint(entries[i].Message, fields)
+		for _, secret := range []string{"wrong-password", "right-password", "acr-access", "scope=", "repository:team"} {
+			assert.NotContains(t, logged, secret)
+		}
+	}
+}
+
+// Stale credentials on a registry whose token realm is on its own host (GHCR,
+// Quay, Harbor) must not break a public image: the realm rejects Basic but
+// hands out an anonymous pull token, as it did before same-host realms got
+// credentials. The rejection is still logged, so the stale credentials show.
+func TestServeGET_OCIPublicImageStaleCredentials_TakesAnonymousToken(t *testing.T) {
+	useUnguardedUpstream(t)
+	logs := observeProxyLog(t)
+
+	var tokenAuth []string
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			tokenAuth = append(tokenAuth, r.Header.Get("Authorization"))
+			if r.Header.Get("Authorization") != "" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = fmt.Fprint(w, `{"errors":[{"code":"UNAUTHORIZED"}]}`)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"token":"public-token"}`)
+			return
+		}
+		if r.Header.Get("Authorization") == "Bearer public-token" {
+			_, _ = fmt.Fprint(w, `{"schemaVersion":2}`)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+			`Bearer realm="%s/token",service="ghcr.io",scope="repository:team/app:pull"`, srv.URL))
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("no"))
+	}))
+	defer srv.Close()
+
+	repo := proxyRepo("ghcr", srv.URL)
+	repo.Format = domain.FormatOCI
+	repo.ProxyConfig["remote_username"] = "expired-user"
+	repo.ProxyConfig["remote_password"] = "expired-password"
+
+	w := acrPull(t, repo)
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, tokenAuth, 2)
+	assert.True(t, strings.HasPrefix(tokenAuth[0], "Basic "))
+	assert.Empty(t, tokenAuth[1])
+
+	entries := logs.FilterMessageSnippet("token request failed").All()
+	require.Len(t, entries, 1, "the rejected credentials are logged; the anonymous token is not a failure")
+	fields := entries[0].ContextMap()
+	assert.Equal(t, true, fields["with_credentials"])
+	assert.NotContains(t, fmt.Sprint(entries[0].Message, fields), "expired-password")
+	assert.NotContains(t, fmt.Sprint(entries[0].Message, fields), "public-token")
+}
+
+// A token realm that fails for a reason other than the credentials — here a
+// 5xx — gets no anonymous second token request: that would only double the
+// load on a struggling upstream. The content retry stays anonymous.
+func TestServeGET_OCITokenEndpointServerError_NoAnonymousTokenRetry(t *testing.T) {
+	useUnguardedUpstream(t)
+	logs := observeProxyLog(t)
+
+	tokenHits := 0
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			tokenHits++
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+			`Bearer realm="%s/token",service="ghcr.io",scope="repository:team/app:pull"`, srv.URL))
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("no"))
+	}))
+	defer srv.Close()
+
+	repo := proxyRepo("ghcr", srv.URL)
+	repo.Format = domain.FormatOCI
+	repo.ProxyConfig["remote_username"] = "puller"
+	repo.ProxyConfig["remote_password"] = "s3cret"
+
+	w := acrPull(t, repo)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Equal(t, 1, tokenHits)
+	entries := logs.FilterMessageSnippet("token request failed").All()
+	require.Len(t, entries, 1)
+	assert.EqualValues(t, http.StatusInternalServerError, entries[0].ContextMap()["status"])
+}
+
+// A realm that cannot be reached is logged by cause, not by the token URL
+// net/http would repeat in its error.
+func TestServeGET_OCITokenEndpointUnreachable_WarnsWithoutURL(t *testing.T) {
+	useUnguardedUpstream(t)
+	logs := observeProxyLog(t)
+
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+			`Bearer realm="%s/token",service="ghcr.io",scope="repository:team/app:pull"`, deadURL))
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("no"))
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("ghcr", upstream.URL)
+	repo.Format = domain.FormatOCI
+
+	w := acrPull(t, repo)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	entries := logs.FilterMessageSnippet("token request failed").All()
+	require.Len(t, entries, 1)
+	fields := entries[0].ContextMap()
+	assert.EqualValues(t, 0, fields["status"])
+	assert.NotContains(t, fmt.Sprint(fields), "scope=")
+}
+
+// remote_url is https and the registry names an http realm on its own host.
+// Neither the realm nor Basic go over that cleartext hop.
+func TestServeGET_OCIHttpSameHostRealmUnderHTTPSRemote_NoBasicNoFetch(t *testing.T) {
+	tokenHits := 0
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			tokenHits++
+			_, _ = fmt.Fprint(w, `{"token":"cleartext"}`)
+			return
+		}
+		calls++
+		w.Header().Set("WWW-Authenticate",
+			`Bearer realm="http://acr.example.io/token",service="acr.example.io",scope="repository:team/app:pull"`)
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("no"))
+	}))
+	defer upstream.Close()
+
+	upURL, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	orig := repoproxy.UpstreamClient
+	repoproxy.UpstreamClient = &http.Client{Transport: hostRewriteTransport{from: "acr.example.io", to: upURL}}
+	t.Cleanup(func() { repoproxy.UpstreamClient = orig })
+
+	repo := proxyRepo("acr", "https://acr.example.io")
+	repo.Format = domain.FormatDocker
+	repo.ProxyConfig["remote_username"] = "puller"
+	repo.ProxyConfig["remote_password"] = "s3cret"
+
+	w := acrPull(t, repo)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, 0, tokenHits)
+}
+
+// hostRewriteTransport sends one registry host to a local server. Every other
+// host, including a token realm, is dialed as written.
+type hostRewriteTransport struct {
+	from string
+	to   *url.URL
+}
+
+func (h hostRewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Hostname() == h.from {
+		cloned := req.Clone(req.Context())
+		u := *cloned.URL
+		u.Scheme = h.to.Scheme
+		u.Host = h.to.Host
+		cloned.URL = &u
+		return http.DefaultTransport.RoundTrip(cloned)
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// proxyRoundTripper redirects requests with Docker Hub host to the fake upstream server,
+// and token server requests to the fake token server.
+type proxyRoundTripper struct {
+	upstreamHost string
+	tokenHost    string
+}
+
+func (p *proxyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Redirect Docker Hub requests to fake upstream.
+	if strings.Contains(req.URL.Host, "docker.io") {
+		newURL := *req.URL
+		newURL.Scheme = "http"
+		newURL.Host = strings.TrimPrefix(p.upstreamHost, "http://")
+		cloned := req.Clone(req.Context())
+		cloned.URL = &newURL
+		return http.DefaultTransport.RoundTrip(cloned)
+	}
+	// Token server requests pass through as-is (they already point at tokenHost).
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// ── isDockerRegistryRemote / parseDockerBearerChallenge (internal) ───────────
+// These are exercised via fetchUpstreamWithDockerHubAuth which is driven through
+// ServeGET above.  We add direct unit tests for the exported behavior that is
+// visible from the package boundary.
+
+// TestServeGET_DockerHub_NoScope_RedoWithoutAuth: when upstream returns 401 but
+// the WWW-Authenticate has no scope and the URL has no /v2/ scope, it should
+// fall back to a second plain request.
+func TestServeGET_DockerHub_NoScopeRedoWithoutAuth(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			// No scope in WWW-Authenticate, non-/v2/ URL so scopeFromRegistryV2URL also empty.
+			w.Header().Set("WWW-Authenticate", `Bearer realm="https://auth.docker.io/token",service="registry.docker.io"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		// Second attempt without auth.
+		assert.Empty(t, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	origClient := repoproxy.UpstreamClient
+	transport := &dockerHubTransport{upstream: upstream}
+	repoproxy.UpstreamClient = &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: transport,
+	}
+	defer func() { repoproxy.UpstreamClient = origClient }()
+
+	repo := proxyRepo("dockernoscope", "https://registry-1.docker.io")
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	// Use a non-/v2/ path so scopeFromRegistryV2URL returns "".
+	c.Request = httptest.NewRequest(http.MethodGet, "/ping", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/ping", "", base.Coords{Name: "ping"}, "", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 2, calls)
+}
+
+// dockerHubTransport routes "registry-1.docker.io" requests to a local test server.
+type dockerHubTransport struct {
+	upstream *httptest.Server
+}
+
+func (d *dockerHubTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.Host, "docker.io") {
+		newURL := *req.URL
+		newURL.Scheme = "http"
+		newURL.Host = strings.TrimPrefix(d.upstream.URL, "http://")
+		cloned := req.Clone(req.Context())
+		cloned.URL = &newURL
+		return http.DefaultTransport.RoundTrip(cloned)
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// ── applyChecksumHeaders (via cache hit) ─────────────────────────────────────
+
+func TestServeGET_CacheHit_WithChecksums(t *testing.T) {
+	repo := proxyRepo("checksum-proxy", "https://upstream.example.com")
+	blobStore := testutil.NewBlobStore()
+	assets := testutil.NewAssetRepo()
+	content := "checksum test content"
+	key := "checksum-key"
+	_ = blobStore.Put(context.TODO(), key, strings.NewReader(content), int64(len(content)))
+	a := &domain.Asset{
+		Repository:   repo.Name,
+		RepositoryID: repo.ID,
+		Path:         "/checksummed.jar",
+		BlobKey:      key,
+		ContentType:  "application/java-archive",
+		SizeBytes:    int64(len(content)),
+		SHA256:       "abc123sha256",
+		SHA1:         "abc123sha1",
+		MD5:          "abc123md5",
+	}
+	_ = assets.Create(context.TODO(), a)
+
+	d := formats.Deps{
+		Repos:      testutil.NewRepoRepo(repo),
+		Blobs:      testutil.NewBlobStoreRepo(),
+		Components: testutil.NewComponentRepo(),
+		Assets:     assets,
+		BlobStore:  blobStore,
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/checksummed.jar", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/checksummed.jar", "", base.Coords{}, "application/java-archive", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "abc123sha256", w.Header().Get("X-Checksum-SHA256"))
+	assert.Equal(t, "abc123sha1", w.Header().Get("X-Checksum-SHA1"))
+	assert.Equal(t, "abc123md5", w.Header().Get("X-Checksum-MD5"))
+	assert.Equal(t, `"abc123sha256"`, w.Header().Get("ETag"))
+}
+
+// TestServeGET_DockerHub_NoScopeInChallenge_V2URL_DerivesScopeFromURL tests that when
+// the 401 WWW-Authenticate has no scope but the URL is a /v2/ path, scopeFromRegistryV2URL
+// is used to derive the scope for token fetching.
+func TestServeGET_DockerHub_ScopeFromV2URL(t *testing.T) {
+	tokenServerCalled := false
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenServerCalled = true
+		scope := r.URL.Query().Get("scope")
+		// scopeFromRegistryV2URL should produce "repository:library/nginx:pull"
+		assert.Equal(t, "repository:library/nginx:pull", scope)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": "nginx-token"})
+	}))
+	defer tokenServer.Close()
+
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			// 401 with no scope in WWW-Authenticate, but URL is /v2/library/nginx/manifests/latest
+			// so scopeFromRegistryV2URL should provide the scope.
+			challenge := fmt.Sprintf(`Bearer realm="%s/token",service="registry.docker.io"`, tokenServer.URL)
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		assert.Equal(t, "Bearer nginx-token", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, `{"schemaVersion":2}`)
+	}))
+	defer upstream.Close()
+
+	origClient := repoproxy.UpstreamClient
+	repoproxy.UpstreamClient = &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &dockerHubTransport{upstream: upstream},
+	}
+	defer func() { repoproxy.UpstreamClient = origClient }()
+
+	repo := proxyRepo("dockerscoped", "https://registry-1.docker.io")
+	d := makeDeps(repo)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v2/library/nginx/manifests/latest", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/v2/library/nginx/manifests/latest", "", base.Coords{Name: "nginx"}, "application/json", 0)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, tokenServerCalled, "token server should have been called with scope from URL")
+	assert.Equal(t, 2, calls)
+}
+
+// ── upstream Basic auth (#281) ────────────────────────────────
+
+// A proxy repo with remote_username/remote_password must present them to the
+// upstream itself (HTTP Basic) — private Maven registries answer 401 without.
+func TestServeGET_SendsUpstreamBasicAuth(t *testing.T) {
+	useUnguardedUpstream(t)
+	var gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		if u, p, ok := r.BasicAuth(); !ok || u != "deploy" || p != "s3cret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = fmt.Fprint(w, "artifact-bytes")
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("pauth", upstream.URL)
+	repo.ProxyConfig["remote_username"] = "deploy"
+	repo.ProxyConfig["remote_password"] = "s3cret"
+	d := makeDeps(repo)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/com/x/a.jar", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/com/x/a.jar", "", base.Coords{}, "", 0)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "artifact-bytes", w.Body.String())
+	assert.Contains(t, gotAuth, "Basic ")
+}
+
+// An absolute origin URL on another host (Helm GitHub releases, a planted
+// index entry) must not receive remote_username. Credentials stay on remote_url.
+func TestServeGET_NoUpstreamAuthOnForeignHost(t *testing.T) {
+	useUnguardedUpstream(t)
+	var foreignAuth string
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		foreignAuth = r.Header.Get("Authorization")
+		_, _ = fmt.Fprint(w, "github-bytes")
+	}))
+	defer foreign.Close()
+
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("remote_url host must not be contacted for an off-host origin; got %s", r.URL)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer remote.Close()
+
+	repo := proxyRepo("pforeign", remote.URL)
+	repo.ProxyConfig["remote_username"] = "deploy"
+	repo.ProxyConfig["remote_password"] = "s3cret"
+	d := makeDeps(repo)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/widget-1.0.0.tgz", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/widget-1.0.0.tgz", foreign.URL+"/widget-1.0.0.tgz", base.Coords{Name: "widget", Version: "1.0.0"}, "", 0)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "github-bytes", w.Body.String())
+	assert.Empty(t, foreignAuth, "off-host origin must not receive remote_username")
+}
+
+// Without credentials configured, no Authorization header is invented.
+func TestServeGET_NoUpstreamAuthByDefault(t *testing.T) {
+	useUnguardedUpstream(t)
+	var sawAuth bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAuth = r.Header.Get("Authorization") != ""
+		_, _ = fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	repo := proxyRepo("pnoauth", upstream.URL)
+	d := makeDeps(repo)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/com/x/b.jar", nil)
+	err := repoproxy.ServeGET(c, d, repo, "/com/x/b.jar", "", base.Coords{}, "", 0)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.False(t, sawAuth)
+}

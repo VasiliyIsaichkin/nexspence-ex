@@ -1,0 +1,119 @@
+.container {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--holo-bg);
+}
+
+.card {
+  width: 400px;
+  background: linear-gradient(135deg, rgba(124,92,255,0.18), rgba(34,211,238,0.08), rgba(255,92,240,0.10));
+  border: 1px solid var(--holo-border);
+  border-radius: 18px;
+  padding: 40px 36px;
+  backdrop-filter: blur(20px);
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+  max-width: 92vw;
+}
+
+.card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 1px;
+  background: var(--holo-gradient);
+  background-size: 200% 200%;
+  animation: holoShift 5s ease infinite;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 28px;
+}
+
+.logoImg {
+  width: 220px;
+  height: auto;
+  display: block;
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  text-align: left;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--holo-text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.error {
+  background: rgba(255,107,107,0.12);
+  border: 1px solid rgba(255,107,107,0.30);
+  border-radius: var(--holo-radius-sm);
+  padding: 10px 12px;
+  color: var(--holo-red);
+  font-size: 13px;
+}
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--holo-text-faint);
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.divider::before,
+.divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: rgba(124,92,255,0.2);
+}
+
+.themeToggle {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid var(--holo-border);
+  background: var(--holo-bg-3);
+  color: var(--holo-text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.themeToggle:hover {
+  color: var(--holo-text);
+  border-color: var(--holo-border-strong);
+}
+
+.themeToggle:focus-visible {
+  outline: none;
+  box-shadow: var(--holo-ring);
+}

@@ -1,0 +1,614 @@
+// Package nuget implements the NuGet v2/v3 repository protocol.
+//
+// NuGet v3 endpoints (under /repository/:repoName/):
+//
+//	GET  /index.json                        → service index (v3)
+//	GET  /v3/registration/:id/index.json    → package registration (metadata)
+//	GET  /v3/flatcontainer/:id/index.json   → version list
+//	GET  /v3/flatcontainer/:id/:ver/:id.:ver.nupkg → download
+//
+// NuGet v2 endpoints:
+//
+//	GET  /FindPackagesById()?id='name'      → OData XML
+//	PUT  /v2/package                        → nuget push (multipart)
+//	DELETE /v2/packages/:id/:ver            → delete
+package nuget
+
+import (
+	"archive/zip"
+	"context"
+	"encoding/json"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"path"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/formats"
+	"github.com/nexspence-oss/nexspence/internal/formats/base"
+	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
+	"github.com/nexspence-oss/nexspence/internal/repository"
+)
+
+// Handler serves the NuGet v2/v3 repository protocol.
+type Handler struct {
+	deps formats.Deps
+	// age caches registration hives and publish times for the
+	// minimum-package-age policy (#643); see age_filter.go.
+	age ageCache
+}
+
+// New creates a NuGet format Handler with the given dependencies.
+func New(deps formats.Deps) *Handler { return &Handler{deps: deps} }
+
+// Name returns the format identifier.
+func (h *Handler) Name() string { return "nuget" }
+
+func (h *Handler) ServeHTTP(c *gin.Context) {
+	p := normPath(c.Param("path"))
+	repoName := c.Param("repoName")
+
+	repo, _ := h.deps.Repos.Get(c.Request.Context(), repoName)
+
+	// Proxy: block mutations; rewrite service index; cache packages.
+	if repo != nil && repo.Type == domain.TypeProxy {
+		h.serveProxy(c, repo, p)
+		return
+	}
+
+	switch {
+	// v3 service index
+	case c.Request.Method == http.MethodGet && p == "/index.json":
+		h.serveIndex(c, repoName)
+
+	// v3 flat container: version list
+	case c.Request.Method == http.MethodGet && strings.HasPrefix(p, "/v3/flatcontainer/") && strings.HasSuffix(p, "/index.json"):
+		pkgID := strings.TrimSuffix(strings.TrimPrefix(p, "/v3/flatcontainer/"), "/index.json")
+		pkgID = strings.Trim(pkgID, "/")
+		h.serveVersionList(c, repoName, pkgID)
+
+	// v3 flat container: download nupkg
+	case c.Request.Method == http.MethodGet && strings.HasPrefix(p, "/v3/flatcontainer/") && strings.HasSuffix(p, ".nupkg"):
+		h.serveFlatContainerDownload(c, repoName, p)
+
+	// v3 registration index
+	case c.Request.Method == http.MethodGet && strings.HasPrefix(p, "/v3/registration/"):
+		h.serveRegistration(c, repoName, p)
+
+	// Another registration hive — one a proxy member advertises through a
+	// group (#678). Not served here: a miss, so a group asks its next member
+	// instead of ending the fan-out on a 405.
+	case c.Request.Method == http.MethodGet && isRegistrationPath(p):
+		c.JSON(http.StatusNotFound, gin.H{"error": "package not found"})
+
+	// v2 OData query: FindPackagesById()
+	case c.Request.Method == http.MethodGet && strings.HasPrefix(p, "/FindPackagesById"):
+		pkgID := c.Query("id")
+		pkgID = strings.Trim(pkgID, "'")
+		h.serveFindPackages(c, repoName, pkgID)
+
+	// v2 push
+	case c.Request.Method == http.MethodPut && p == "/v2/package":
+		h.handlePush(c, repoName)
+
+	// v2 delete: DELETE {PackagePublish}/:id/:ver. The service index
+	// advertises PackagePublish as /v2/package, so that is what
+	// `dotnet nuget delete` sends; /v2/packages/ stays for existing callers.
+	case c.Request.Method == http.MethodDelete &&
+		(strings.HasPrefix(p, "/v2/package/") || strings.HasPrefix(p, "/v2/packages/")):
+		h.handleDelete(c, repoName, p)
+
+	default:
+		c.Status(http.StatusMethodNotAllowed)
+	}
+}
+
+// serveProxy answers a request to a proxy repository.
+func (h *Handler) serveProxy(c *gin.Context, repo *domain.Repository, p string) {
+	if repoproxy.RejectMutation(c, repo) {
+		return
+	}
+	if (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) && p == "/index.json" {
+		h.fetchAndRewriteNuGetIndex(c, repo)
+		return
+	}
+	// .nupkg package content is immutable; registration/flat-container index
+	// pages are mutable metadata (new versions appear) and revalidate on a TTL.
+	var maxAge time.Duration
+	if !strings.HasSuffix(p, ".nupkg") {
+		maxAge = repoproxy.MetadataMaxAge(repo)
+	}
+	coords := proxyCoords(p)
+	// Resource paths advertised by the rewritten index are the upstream's
+	// own paths re-rooted locally — forward them onto the bare origin,
+	// not onto a possibly /v3-suffixed remote_url (#349).
+	upstreamPath := ""
+	if origin := nugetRemoteOrigin(remoteURLOf(repo)); origin != "" {
+		upstreamPath = origin + p
+	}
+	// Registration documents embed absolute upstream URLs (packageContent,
+	// page and leaf @id) — rewrite them on serve so clients pull pages and
+	// packages through this proxy (#98), in whichever hive the upstream's
+	// service index advertised (#678); the cache keeps the upstream
+	// original. Served through a group, the links stay on the group, as
+	// the group's own service index does.
+	var rewrite func([]byte) []byte
+	if isRegistrationPath(p) {
+		served := repo.Name
+		if g := c.GetString(formats.GroupRepoKey); g != "" {
+			served = g
+		}
+		localBase := strings.TrimRight(h.deps.BaseURL, "/") + "/repository/" + served
+		rewrite = func(b []byte) []byte { return RewriteRegistration(b, localBase) }
+	}
+	if minAge := repoproxy.MinimumPackageAge(repo); minAge > 0 {
+		if done := h.applyAgePolicy(c, repo, p, minAge, &rewrite); done {
+			return
+		}
+	}
+	if err := repoproxy.ServeGETRewritten(c, h.deps, repo, p, upstreamPath, coords, "application/octet-stream", maxAge, rewrite); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+	}
+}
+
+// handleDelete removes one package version (#589). The id and version are
+// matched the way NuGet compares them, not as the user typed them. The version lists
+// are built from components, so the component goes too — a listed version
+// whose package is gone makes restore report the whole feed as invalid.
+func (h *Handler) handleDelete(c *gin.Context, repoName, p string) {
+	rest := strings.TrimPrefix(strings.TrimPrefix(p, "/v2/packages/"), "/v2/package/")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "expected /v2/package/:id/:version"})
+		return
+	}
+	ctx := c.Request.Context()
+	// Every stored casing of the version: they are one NuGet version (#590).
+	paths, err := h.storedNupkgPaths(ctx, repoName, parts[0], parts[1], false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if len(paths) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "package not found"})
+		return
+	}
+	for _, filePath := range paths {
+		if err := base.DeleteArtifact(ctx, h.deps, repoName, filePath); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if err := h.deps.Components.DeleteOrphans(ctx, repoName); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (h *Handler) serveIndex(c *gin.Context, repoName string) {
+	base2 := h.deps.BaseURL + "/repository/" + repoName
+	c.JSON(http.StatusOK, gin.H{
+		"version": "3.0.0",
+		"resources": []gin.H{
+			{"@id": base2 + "/v3/flatcontainer/", "@type": "PackageBaseAddress/3.0.0"},
+			{"@id": base2 + "/v3/registration/", "@type": "RegistrationsBaseUrl/3.0.0"},
+			{"@id": base2 + "/v2/package", "@type": "PackagePublish/2.0.0"},
+			{"@id": base2 + "/v2/", "@type": "LegacyGallery/2.0.0"},
+		},
+	})
+}
+
+// packageVersions returns the stored versions of exactly pkgID. Ids are
+// stored lowercased on push. Search matches substrings, which would list
+// Foo.Abstractions's versions under Foo and stop at one page (#586).
+func (h *Handler) packageVersions(ctx context.Context, repoName, pkgID string) ([]domain.Component, error) {
+	return base.ExactComponents(ctx, h.deps.Components, domain.SearchParams{
+		Repository: repoName, Name: strings.ToLower(pkgID),
+	})
+}
+
+func (h *Handler) serveVersionList(c *gin.Context, repoName, pkgID string) {
+	comps, err := h.packageVersions(c.Request.Context(), repoName, pkgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// The flat container lists lowercased normalized versions, each once.
+	comps = distinctVersions(comps)
+	versions := make([]string, 0, len(comps))
+	for _, comp := range comps {
+		versions = append(versions, versionKey(comp.Version))
+	}
+	c.JSON(http.StatusOK, gin.H{"versions": versions})
+}
+
+// distinctVersions keeps the first component of each NuGet version. A
+// version pushed before #590 is stored as written, so 1.0.0-Beta and
+// 1.0.0-BETA may both exist; they are one version.
+func distinctVersions(comps []domain.Component) []domain.Component {
+	seen := make(map[string]bool, len(comps))
+	out := comps[:0:0]
+	for _, comp := range comps {
+		k := versionKey(comp.Version)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, comp)
+	}
+	return out
+}
+
+// storedNupkgPaths returns where the packages of one NuGet version are stored:
+// the normalized path every push uses since #590, and the paths of packages
+// pushed before it, stored under the version as written in their nuspec.
+// With firstOnly, a package at the normalized path ends the search.
+func (h *Handler) storedNupkgPaths(ctx context.Context, repoName, id, version string, firstOnly bool) ([]string, error) {
+	var out []string
+	normalized := nupkgPath(id, version)
+	switch _, err := h.deps.Assets.GetByPath(ctx, repoName, normalized); {
+	case err == nil:
+		out = append(out, normalized)
+		if firstOnly {
+			return out, nil
+		}
+	case !errors.Is(err, repository.ErrNotFound):
+		return nil, err
+	}
+	comps, err := h.packageVersions(ctx, repoName, id)
+	if err != nil {
+		return nil, err
+	}
+	key := versionKey(version)
+	for _, comp := range comps {
+		if versionKey(comp.Version) != key {
+			continue
+		}
+		assets, err := h.deps.Assets.ListByComponentID(ctx, comp.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range assets {
+			if strings.HasSuffix(a.Path, ".nupkg") && a.Path != normalized {
+				out = append(out, a.Path)
+			}
+		}
+	}
+	return out, nil
+}
+
+// proxyCoords derives component coordinates for a proxied path. A cached
+// package must carry its real name and version — the OSV/Trivy scan queries
+// by them, so the path-derived fallback name and placeholder version made
+// every package pulled through a NuGet proxy invisible to vulnerability
+// scanning, the same root cause #336 closed for Cargo.
+//
+// A proxy repo forwards whatever local path the client requested straight
+// onto upstream (upstreamPath := origin + p, above) — unlike a hosted repo,
+// it never goes through this file's own "/v3/flatcontainer/" switch-case
+// routes. A real client (nuget.exe, dotnet) requests packages at whatever
+// address the upstream's own index.json/config.json advertised, which for
+// nuget.org and most feeds is "/v3-flatcontainer/" (hyphenated, a sibling of
+// "/v3/", not nested inside it — see TestNuGet_ProxyFlatcontainer_
+// ResolvesAgainstRealShape). Matching on a specific prefix would silently
+// miss that real shape, so this matches by suffix instead: any ".nupkg" path
+// is exactly ":id/:ver/:id.:ver.nupkg" — the same 3-segment split
+// serveFlatContainerDownload already does for hosted downloads, applied to
+// the path's last 3 segments regardless of what comes before them.
+// Registration/index pages are versionless metadata and keep the generic
+// fallback.
+func proxyCoords(p string) base.Coords {
+	if !strings.HasSuffix(p, ".nupkg") {
+		return base.Coords{}
+	}
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	if len(parts) < 3 {
+		return base.Coords{}
+	}
+	id, ver := parts[len(parts)-3], parts[len(parts)-2]
+	if id == "" || ver == "" {
+		return base.Coords{}
+	}
+	return base.Coords{Name: strings.ToLower(id), Version: ver}
+}
+
+func (h *Handler) serveFlatContainerDownload(c *gin.Context, repoName, p string) {
+	// /v3/flatcontainer/:id/:ver/:id.:ver.nupkg
+	parts := strings.Split(strings.TrimPrefix(p, "/v3/flatcontainer/"), "/")
+	if len(parts) < 3 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "invalid nupkg path"})
+		return
+	}
+	paths, err := h.storedNupkgPaths(c.Request.Context(), repoName, parts[0], parts[1], true)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if len(paths) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "package not found"})
+		return
+	}
+
+	rc, asset, err := base.FetchArtifact(c.Request.Context(), h.deps, repoName, paths[0])
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	defer func() { _ = rc.Close() }()
+	c.DataFromReader(http.StatusOK, asset.SizeBytes, "application/zip", rc, nil)
+}
+
+func (h *Handler) serveRegistration(c *gin.Context, repoName, p string) {
+	// /v3/registration/:id/index.json
+	rest := strings.TrimPrefix(p, "/v3/registration/")
+	pkgID := strings.TrimSuffix(rest, "/index.json")
+	pkgID = strings.Trim(pkgID, "/")
+
+	comps, err := h.packageVersions(c.Request.Context(), repoName, pkgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if len(comps) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "package not found"})
+		return
+	}
+
+	base2 := h.deps.BaseURL + "/repository/" + repoName
+	comps = distinctVersions(comps)
+	items := make([]gin.H, 0, len(comps))
+	for _, comp := range comps {
+		version := versionKey(comp.Version)
+		entryURL := base2 + "/v3/registration/" + pkgID + "/" + version + ".json"
+		items = append(items, gin.H{
+			"@id":            entryURL,
+			"packageContent": base2 + "/v3/flatcontainer" + nupkgPath(pkgID, version),
+			"catalogEntry": gin.H{
+				"id":        comp.Name,
+				"version":   version,
+				"listed":    true,
+				"published": comp.CreatedAt.UTC().Format(time.RFC3339),
+			},
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"@id":   base2 + "/v3/registration/" + pkgID + "/index.json",
+		"count": 1,
+		"items": []gin.H{{
+			"count": len(items),
+			"items": items,
+			"lower": versionKey(comps[0].Version),
+			"upper": versionKey(comps[len(comps)-1].Version),
+		}},
+	})
+}
+
+// OData v2 compatible FindPackagesById response
+type feed struct {
+	XMLName xml.Name `xml:"feed"`
+	XMLNS   string   `xml:"xmlns,attr"`
+	Entries []entry  `xml:"entry"`
+}
+type entry struct {
+	XMLName xml.Name `xml:"entry"`
+	Title   string   `xml:"title"`
+	ID      string   `xml:"id"`
+	Content content  `xml:"content"`
+}
+type content struct {
+	Type string `xml:"type,attr"`
+	Src  string `xml:"src,attr"`
+}
+
+func (h *Handler) serveFindPackages(c *gin.Context, repoName, pkgID string) {
+	comps, err := h.packageVersions(c.Request.Context(), repoName, pkgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	base2 := h.deps.BaseURL + "/repository/" + repoName
+	f := feed{XMLNS: "http://www.w3.org/2005/Atom"}
+	for _, comp := range distinctVersions(comps) {
+		version := versionKey(comp.Version)
+		f.Entries = append(f.Entries, entry{
+			Title: comp.Name + " " + version,
+			ID:    base2 + "/v2/Packages(Id='" + comp.Name + "',Version='" + version + "')",
+			Content: content{
+				Type: "application/zip",
+				Src:  base2 + "/v3/flatcontainer" + nupkgPath(comp.Name, version),
+			},
+		})
+	}
+	c.Header("Content-Type", "application/atom+xml; charset=utf-8")
+	c.XML(http.StatusOK, f)
+}
+
+func (h *Handler) handlePush(c *gin.Context, repoName string) {
+	if err := c.Request.ParseMultipartForm(64 << 20); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	f, fh, err := c.Request.FormFile("package")
+	if err != nil {
+		// some clients use "file" as field name
+		f, fh, err = c.Request.FormFile("file")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "missing package file"})
+			return
+		}
+	}
+	defer func() { _ = f.Close() }()
+
+	pkgID, version := nupkgCoords(f, fh.Size, fh.Filename)
+	// Stored under the spec's flat-container path: one NuGet version is one
+	// package, however its nuspec spells it (#590).
+	version = versionKey(version)
+	filePath := nupkgPath(pkgID, version)
+
+	coords := base.Coords{Name: pkgID, Version: version}
+	if _, err := base.StoreArtifact(c.Request.Context(), h.deps,
+		repoName, filePath, "application/zip", coords, f, fh.Size); err != nil {
+		c.JSON(base.HTTPStatusForError(err), gin.H{"error": err.Error()})
+		return
+	}
+	c.Status(http.StatusCreated)
+}
+
+// nuspecMeta is the subset of the .nuspec manifest needed for coordinates.
+type nuspecMeta struct {
+	Metadata struct {
+		ID      string `xml:"id"`
+		Version string `xml:"version"`
+	} `xml:"metadata"`
+}
+
+// nupkgCoords resolves the package id and version for an uploaded .nupkg.
+// The .nuspec inside the archive is authoritative; the filename is a fallback
+// (version = the trailing dot-separated parts starting at the first digit-led
+// part, so "Newtonsoft.Json.13.0.1" → id "newtonsoft.json", version "13.0.1"
+// — a naive last-dot split corrupts real semver coordinates, #100).
+func nupkgCoords(f io.ReaderAt, size int64, filename string) (string, string) {
+	if zr, err := zip.NewReader(f, size); err == nil {
+		for _, zf := range zr.File {
+			if !strings.HasSuffix(zf.Name, ".nuspec") || strings.Contains(zf.Name, "/") {
+				continue
+			}
+			rc, err := zf.Open()
+			if err != nil {
+				continue
+			}
+			var meta nuspecMeta
+			err = xml.NewDecoder(io.LimitReader(rc, 1<<20)).Decode(&meta)
+			_ = rc.Close()
+			if err == nil && meta.Metadata.ID != "" && meta.Metadata.Version != "" {
+				return strings.ToLower(meta.Metadata.ID), meta.Metadata.Version
+			}
+		}
+	}
+	name := strings.TrimSuffix(filename, ".nupkg")
+	parts := strings.Split(name, ".")
+	for i := 1; i < len(parts); i++ {
+		if parts[i] != "" && parts[i][0] >= '0' && parts[i][0] <= '9' {
+			return strings.ToLower(strings.Join(parts[:i], ".")), strings.Join(parts[i:], ".")
+		}
+	}
+	return strings.ToLower(name), "0.0.0"
+}
+
+// fetchAndRewriteNuGetIndex fetches the NuGet v3 service index from upstream,
+// rewrites all resource @id URLs to point to this proxy, and returns the result.
+// Not cached — fetched live so new resource endpoints appear promptly.
+func (h *Handler) fetchAndRewriteNuGetIndex(c *gin.Context, repo *domain.Repository) {
+	remoteBase, err := repoproxy.RemoteURL(repo)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	// The v3 service index is the ONE fixed path in an otherwise fully
+	// discoverable protocol, and it lives at /v3/index.json on the real
+	// nuget.org (#349). remote_url is the bare origin; a legacy /v3-suffixed
+	// value is normalized so it neither breaks discovery nor doubles itself
+	// onto the resource paths the index advertises.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nugetRemoteOrigin(remoteBase)+"/v3/index.json", nil)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid upstream URL: " + err.Error()})
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+
+	repoproxy.SetUpstreamAuth(req, repo)
+	resp, err := repoproxy.ClientFor(repo).Do(req)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "upstream fetch failed: " + err.Error()})
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("upstream returned %d", resp.StatusCode)})
+		return
+	}
+
+	var index map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&index); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid upstream index.json: " + err.Error()})
+		return
+	}
+
+	// Rewrite each resource's @id to point through this proxy.
+	// Parse the upstream @id URL, keep only its path, prepend our local base.
+	localBase := strings.TrimRight(h.deps.BaseURL, "/") + "/repository/" + repo.Name
+
+	if resources, ok := index["resources"].([]any); ok {
+		kept := resources[:0]
+		for _, r := range resources {
+			res, ok := r.(map[string]any)
+			if !ok {
+				kept = append(kept, r)
+				continue
+			}
+			// The upstream's repository signing certificates. dotnet requires
+			// this resource over https, so rewritten onto an http proxy it
+			// refuses the whole source (NU1301), and pointing at the upstream
+			// breaks clients without internet access. The proxy does not
+			// verify repository signatures, so it does not advertise them;
+			// author signatures inside a .nupkg are still checked (#631).
+			if t, _ := res["@type"].(string); strings.HasPrefix(t, "RepositorySignatures/") {
+				continue
+			}
+			kept = append(kept, res)
+			id, ok := res["@id"].(string)
+			if !ok {
+				continue
+			}
+			parsed, err := url.Parse(id)
+			if err != nil {
+				continue
+			}
+			res["@id"] = localBase + parsed.RequestURI()
+		}
+		index["resources"] = kept
+	}
+
+	if c.Request.Method == http.MethodHead {
+		c.Status(http.StatusOK)
+		return
+	}
+	c.JSON(http.StatusOK, index)
+}
+
+// nugetRemoteOrigin normalizes remote_url to the registry's bare origin: a
+// legacy configuration carried a /v3 suffix (once the only way the index fetch
+// worked), which would double itself onto every already-correct resource path.
+// The service index URL itself (…/v3/index.json) is the feed URL NuGet clients
+// and Nexus use, so it is accepted the same way (#629).
+func nugetRemoteOrigin(remoteBase string) string {
+	base := strings.TrimSuffix(strings.TrimRight(remoteBase, "/"), "/index.json")
+	return strings.TrimSuffix(strings.TrimRight(base, "/"), "/v3")
+}
+
+// remoteURLOf reads the repository's remote_url, empty when unset.
+func remoteURLOf(repo *domain.Repository) string {
+	base, err := repoproxy.RemoteURL(repo)
+	if err != nil {
+		return ""
+	}
+	return base
+}
+
+func normPath(p string) string {
+	return path.Clean("/" + strings.TrimPrefix(p, "/"))
+}

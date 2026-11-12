@@ -1,0 +1,404 @@
+http:
+  addr: ":8081"
+  read_timeout_sec: 1800
+  write_timeout_sec: 1800
+  max_body_mb: 1024            # max request body size (MB); requests above this get 413 (artifact/upload routes exempt)
+  # Origins allowed to read API responses from a browser. Empty (the default)
+  # sends no Access-Control-Allow-Origin at all, which is what you want when the
+  # bundled UI is served from this same origin. List the origins that need it
+  # when the UI is hosted separately; ["*"] lets any website read responses —
+  # including internal artifacts from anonymous repositories — so opt in only
+  # for a deliberately public instance.
+  cors_origins: []            # e.g. ["https://ui.example.com"] or ["*"]
+  base_url: "http://localhost:8081"
+  # Peers allowed to set X-Forwarded-For, as IPs or CIDRs. Empty (the default)
+  # trusts nobody, so the audit log and the rate limiter use the real peer
+  # address. Set this to your reverse proxy when you run behind one, otherwise
+  # every request looks like it comes from the proxy. "*" trusts every hop —
+  # only safe when the server cannot be reached except through that proxy.
+  trusted_proxies: []         # e.g. ["10.0.0.0/8"] or ["*"]
+  # Content-Security-Policy for the bundled UI and the API. Empty uses the
+  # built-in policy (same-origin scripts, no inline script, no framing);
+  # "off" omits the header when a reverse proxy sets its own. Artifact paths
+  # (/repository/, /v2/) are never covered — raw repositories are used to host
+  # documentation sites that carry their own scripts.
+  csp: ""
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+
+# Outbound requests to URLs that come from configuration: proxy upstreams,
+# webhook endpoints, replication targets.
+outbound:
+  # Every loopback, private, link-local, CGNAT, multicast and broadcast address
+  # is refused by default. That is what stops a proxy repository pointed at
+  # http://169.254.169.254/… from turning repository-admin into cloud
+  # credential theft. Name a range here when you genuinely proxy an on-prem
+  # registry — it is the one way to reach an internal address.
+  allowed_internal_cidrs: []   # e.g. ["10.20.0.0/16", "registry.internal.example.com is resolved, so use its range"]
+
+database:
+  dsn: "postgres://nexspence:nexspence@localhost:5432/nexspence?sslmode=disable"
+  # Connection pool, per instance: replicas multiply it, and PostgreSQL's
+  # default max_connections is 100. A pool parameter in the DSN itself
+  # (pool_max_conns, pool_min_conns, pool_max_conn_idle_time) takes precedence;
+  # 0 keeps pgx's default (max_conns: max(4, CPUs)). min_conns is lowered to
+  # max_conns when it would exceed it, unless both are set here that way.
+  max_conns: 20
+  min_conns: 5
+  max_idle_sec: 300
+
+storage:
+  default_type: "local"
+  local:
+    base_path: "./data/blobs"
+  # s3:
+  #   bucket: "nexspence-blobs"
+  #   region: "us-east-1"
+  #   endpoint: "http://minio:9000"   # for MinIO
+  #   access_key_id: ""
+  #   secret_access_key: ""
+  #   force_path_style: true
+  #   skip_tls_verify: false        # accept an unverifiable certificate (private CA); off by default
+  # azure:                          # default_type: "azure"; the container must already exist
+  #   container: "nexspence-blobs"
+  #   account_name: "mystorage"     # required unless a connection string carries it
+  #   account_key: ""               # shared key; enables presigning
+  #   connection_string: ""         # wins over account_name/account_key/sas_token
+  #   sas_token: ""                 # pre-generated SAS; disables presigning
+  #   endpoint: ""                  # e.g. http://127.0.0.1:10000/devstoreaccount1 (Azurite)
+  #   skip_tls_verify: false
+  #   # leave every credential empty to use the host's Entra ID identity
+  #   # (managed identity, az CLI login); presigning then uses user delegation SAS
+
+auth:
+  jwt_secret: "CHANGE_ME_AT_LEAST_32_CHARACTERS_LONG"   # from source / native install: set this (or NEXSPENCE_AUTH_JWT_SECRET) — server refuses to start with this placeholder unless allow_insecure_defaults=true. The Docker image and Helm chart auto-generate a unique secret when it is unset, so you don't set it there.
+  # Optional dedicated key for encrypting replication credentials (recommended).
+  # Without it the key is derived from jwt_secret, so rotating jwt_secret would
+  # invalidate stored replication passwords. Generate: openssl rand -base64 32
+  # encryption_key: ""
+  jwt_expiry_hours: 24
+  # Permit the shipped default JWT secret / admin password ("admin123") at startup.
+  # Leave false in production — the server refuses to start with shipped defaults
+  # unless this is true (intended for local dev / quick-start only).
+  allow_insecure_defaults: false
+  # Instance-wide switch above the per-repository allow_anonymous opt-in.
+  # false refuses every unauthenticated request, whatever the repositories say.
+  anonymous_enabled: true
+  password_min_length: 8
+  bcrypt_cost: 12
+  token_max_days: 180
+  # Token-bucket throttle per authenticated user, or per client address for
+  # anonymous calls. On by default: without it /api/v1/login is an unmetered
+  # guessing surface that also burns a bcrypt (cost 12) per attempt. Independent
+  # of this, repeated failed logins are throttled per account — see
+  # docs/security-rbac.md.
+  rate_limit_enabled: true
+  rate_limit_rps: 50          # sustained requests/sec
+  rate_limit_burst: 100       # burst capacity
+
+# Bootstrap: create the admin user on server start.
+# Safe to run repeatedly — it creates the account when it is missing and
+# otherwise leaves it alone; a password you have already changed is never
+# overwritten from here (rotate it in the UI or over the API).
+# Override via env: NEXSPENCE_BOOTSTRAP_ADMIN_PASSWORD=secret
+#
+# Once real accounts exist you can set enabled: false and delete the four
+# admin_* lines — the credentials then no longer live in this file at all.
+# Do that only after the admin password has been set, otherwise the seeded
+# account has no usable password and nobody can log in.
+bootstrap:
+  enabled: true
+  admin_username: "admin"
+  admin_password: "admin123"   # change this!
+  admin_email:    "admin@example.com"
+  admin_first_name: "Admin"
+  # The admin account is created on a fresh install and never again: on an
+  # instance that already has users, a missing admin row means the account
+  # was deleted on purpose and stays deleted. Set recreate: true to bring it
+  # back anyway.
+  recreate: false
+
+log:
+  level: "info"   # debug | info | warn | error
+  format: "json"  # json | text
+
+search:
+  min_query_len: 2
+
+# Prometheus scrape endpoint (GET /metrics).
+# It is served on the same listener as the API, so by default it requires a
+# Bearer token (a JWT or an nxs_* token) — an anonymous scrape would publish
+# install size, artifact and download counts and the Go runtime fingerprint.
+# Set public: true when the listener is only reachable from a trusted network
+# (a cluster-internal Service, a localhost bind, or a reverse proxy that blocks
+# /metrics from outside); then Prometheus scrapes it with no token secret.
+metrics:
+  public: false
+
+# OpenTelemetry distributed tracing (off by default). Where /metrics answers
+# "the p99 went up", tracing answers "this one request got stuck waiting on
+# what": per-request causality across HTTP -> DB -> blob store, the background
+# jobs (cleanup, GC, migrations, replication), and — via W3C traceparent on
+# replication's outgoing requests — across instances. Bring your own OTLP
+# backend (Jaeger, Tempo, ...), the same way you bring Prometheus for /metrics.
+# To always keep error traces, configure tail-sampling in your collector —
+# a head sampler decides before the response status exists and cannot do it.
+tracing:
+  enabled: false
+  otlp_endpoint: "localhost:4317"  # OTLP receiver (4317 grpc, 4318 http)
+  otlp_protocol: "grpc"            # "grpc" or "http"
+  otlp_insecure: false             # true for a plaintext collector (same host / internal network)
+  sample_ratio: 0.1                # head-sampling ratio for root spans, 0..1
+  service_name: "nexspence"        # service.name resource attribute
+  environment: ""                  # deployment.environment attribute, e.g. "prod"
+
+cleanup:
+  default_schedule: "0 */6 * * *"   # cron schedule used for policies without schedule_cron
+
+# Blob garbage collection: remove blobs no longer referenced by any asset.
+gc:
+  enabled: true              # run scheduled blob garbage collection
+  schedule: "0 3 * * 0"      # cron: weekly, Sunday 03:00
+  min_age: "24h"             # only collect orphans older than this (grace period)
+
+# Automatic promotion on publish — applies to promotion rules with
+# auto_promote on ("Promote automatically on publish" in the UI). Every replica
+# runs the worker; the queue is shared through the database.
+promotion:
+  auto_settle_window: "30s"  # promote once no new file has arrived for this long (multi-file uploads move once)
+  auto_scan_wait: "1h"       # a rule requiring a scan waits this long for one, then records the promotion as blocked
+  auto_poll_interval: "5s"   # how often the worker looks for components due for promotion
+
+# Docker / OCI registry settings.
+# The /v2/ blob-upload paths are exempt from http.max_body_mb so large image
+# layers are not truncated, which makes max_upload_bytes the only bound on a
+# staged upload: a chunk that would push a session past it is rejected with
+# 413 before the session is buffered. Raise it if you push layers larger than
+# the default; 0 removes the cap entirely (not recommended on a shared instance).
+docker:
+  max_upload_bytes: 10737418240   # 10 GiB per blob upload session
+
+# Helm settings.
+# A Helm proxy resolves where each uncached chart tarball comes from out of the
+# upstream index.yaml, so that index is fetched on the download path as well as
+# the catalog one. index_cache_ttl is how long a fetched index answers those
+# lookups: without it, the first pull through a group costs one index download
+# per proxy member, and an index like Bitnami's is tens of megabytes. A chart
+# version already published never changes its URL, so the window only delays
+# charts published upstream inside it. 0 fetches the index per lookup.
+# The index served to clients at /index.yaml is never cached.
+helm:
+  index_cache_ttl: "5m"
+
+# Proxy metadata that needs URL rewriting is buffered before serving. This cap
+# applies to both upstream downloads and cache reads (npm packuments, PyPI
+# indexes and NuGet metadata). Raise it for large packages such as vite; the
+# default remains 32 MiB. Must be positive; 0 does not disable the bound.
+# Larger values increase memory use per concurrent metadata request.
+# Env override: NEXSPENCE_PROXY_MAX_REWRITTEN_METADATA_BYTES=134217728 (128 MiB).
+proxy:
+  max_rewritten_metadata_bytes: 33554432
+
+# Automatic vulnerability scanning.
+# Every upload is queued for a background scan; the queue is bounded and drops
+# rather than delaying an upload, so the periodic full re-scan below is also the
+# safety net for what a burst skips. It re-checks already-scanned components
+# against newly published CVEs, which nothing else does.
+scan:
+  enabled: true              # false leaves scanning entirely on-demand (API only)
+  schedule: "0 3 * * *"      # cron: daily 03:00; empty disables only the bulk re-scan
+
+  # Image scanning (Docker/OCI) runs Trivy, which nexspence does NOT ship:
+  # no binary in the image, no wrapper for one. You supply it — on the host, or
+  # copied into the container by an initContainer / one-shot service. See
+  # docs/scanning.md for a complete procedure per deployment type.
+  #
+  # Package scanning (Maven, npm, PyPI, Cargo) uses OSV.dev over HTTPS, needs
+  # nothing installed, and is unaffected by everything below.
+  trivy:
+    enabled: false           # true turns image scanning on; it stays unavailable until a binary is found
+    bin: "trivy"             # path to the binary, or a name resolved through PATH
+    # Where Trivy reads its vulnerability database. Empty means Trivy's own
+    # defaults (ghcr.io). A nexspence proxy repository in front of ghcr.io works
+    # here — trivy-db is an ordinary OCI artifact:
+    #   db_repository:
+    #     - nexspence.example.com/repository/ghcr-proxy/aquasecurity/trivy-db:2
+    db_repository: []
+    java_db_repository: []
+    skip_db_update: false    # true in an air-gapped deployment where the DB is seeded by hand
+    cache_dir: ""            # empty keeps TRIVY_CACHE_DIR / Trivy's default
+
+# Audit log retention.
+# Events live in monthly PostgreSQL partitions.
+# Rotator pre-creates partitions for the next `lookahead_months` ahead and
+# DETACH/DROPs partitions whose end-date is older than `retention_days`.
+# `soft_cap` is observability-only — when total rows exceed the cap, a warning
+# is logged and `audit_events_count` metric is updated; nothing is deleted.
+audit:
+  retention_days: 90
+  soft_cap: 1000000
+  rotation_interval: 24h
+  lookahead_months: 2
+
+# ── LDAP / Active Directory authentication ───────────────────────────────────
+# Set enabled: true and configure the block below to allow LDAP/AD login.
+# Local admin account always works regardless of LDAP settings.
+#
+# Env overrides: NEXSPENCE_LDAP_ENABLED, NEXSPENCE_LDAP_BIND_PASSWORD, etc.
+ldap:
+  enabled: false
+  # Cache successful LDAP Basic-auth checks for this long (0 keeps every
+  # request live against LDAP). Directory password, lockout, and group changes
+  # can take effect up to this long later. Maximum: 1m.
+  basic_auth_cache_ttl: 0s
+
+  # LDAP server address
+  host: "ldap.example.com"
+  port: 636                  # 636 for LDAPS
+
+  # TLS options (use one or neither)
+  use_tls: true             # connect directly over TLS (LDAPS)
+  start_tls: false           # upgrade plain connection with STARTTLS
+  insecure_skip_verify: false # set true only for self-signed certs in dev
+
+  # Service account used to search the directory (leave empty for anonymous bind)
+  bind_dn: "CN=ServiceAccount,OU=ServiceAccounts,DC=example,DC=com"
+  bind_password: ""          # set via NEXSPENCE_LDAP_BIND_PASSWORD env var
+
+  # User search
+  search_base: "DC=example,DC=com"
+  search_filter: "(sAMAccountName={0})"  # {0} is replaced with the username; AD: (sAMAccountName={0}); LDAP: (uid={0})
+
+  # Attribute mapping (LDAP attr name → Nexspence field)
+  user_attributes:
+    email:      "mail"
+    first_name: "givenName"
+    last_name:  "sn"
+
+  # Group / role mapping (optional — leave group_base empty to skip)
+  group_base:      "DC=example,DC=com"
+  group_filter:    "(member={dn})"   # {dn} is replaced with the user's DN
+  group_attribute: "cn"              # group attribute used as the Nexspence role name
+
+  # Automatically create a local user record on first successful LDAP login
+  auto_create_users: true
+
+  # If set, any LDAP user whose groups include this name is automatically granted
+  # the nx-admin role on every login. Leave empty to disable.
+  admin_group: ""
+
+  # Network timeout for LDAP operations (seconds)
+  timeout_sec: 10
+
+  # ── Active Directory example ─────────────────────────────────
+  # host: "ad.corp.example.com"
+  # port: 389
+  # start_tls: true
+  # bind_dn: "CORP\\svc-nexspence"   # or UPN: svc-nexspence@corp.example.com
+  # search_base: "DC=corp,DC=example,DC=com"
+  # search_filter: "(sAMAccountName={0})"
+  # group_filter: "(member:1.2.840.113556.1.4.1941:={dn})"  # recursive AD groups
+
+# ── OIDC / OAuth2 SSO ────────────────────────────────────────────────────────
+# Single provider per deployment (Keycloak / Google / Microsoft Entra / Okta).
+# Coexists with local + LDAP auth — login flow routes by user.Source.
+#
+# When using docker-compose.yml or docker-compose.ha.yml, OIDC is enabled via
+# the env var NEXSPENCE_OIDC_ENABLED=true — no need to edit this file.
+# Configure here only when running without Docker Compose.
+#
+# Cookie key: `make oidc-secret` generates a 32-byte base64 value.
+# Env overrides: NEXSPENCE_OIDC_CLIENT_SECRET, NEXSPENCE_OIDC_COOKIE_KEY.
+oidc:
+  enabled: false
+  display_name: "SSO"                 # button text: "Sign in with {DisplayName}"
+  issuer: ""                          # e.g. "https://kc.example.com/realms/nexspence"
+  client_id: ""
+  client_secret: ""                   # set via NEXSPENCE_OIDC_CLIENT_SECRET env var
+  redirect_url: ""                    # "https://nexspence.example.com/api/v1/auth/oidc/callback"
+  frontend_base_url: ""               # "https://nexspence.example.com" — callback redirect target
+  scopes: ["openid", "profile", "email"]
+
+  # Provisioning: jit | allowlist | manual
+  provisioning: "jit"
+  email_allowlist: []                 # required when provisioning=allowlist; path.Match globs
+
+  # Role resolution: claim value → Nexspence role
+  groups_claim: "groups"              # "roles" for Entra app-roles; empty for Google w/o Admin SDK
+  admin_group: ""                     # if set & present in claim → nx-admin
+  role_mappings: {}                   # e.g. { "developers": "release-manager" }
+  # Google Workspace: the id_token never carries groups. Look them up in the
+  # directory instead (service account with domain-wide delegation for
+  # admin.directory.group.readonly, impersonating a Workspace admin). Group
+  # EMAILS are what admin_group / role_mappings then match against. A failed
+  # lookup leaves the user's existing roles untouched (never a lockout).
+  google_admin_sdk:
+    enabled: false
+    service_account_key: ""           # JSON key inline (or NEXSPENCE_OIDC_GOOGLE_ADMIN_SDK_SERVICE_ACCOUNT_KEY)
+    service_account_key_file: ""      # ...or a path to the JSON key file
+    subject_email: ""                 # e.g. "admin@company.com"
+
+  # Claim name overrides (provider-specific tweaks)
+  username_claim: "preferred_username"  # Google: use "email"
+  email_claim: "email"
+  name_claim: "name"
+
+  # Security
+  show_login_button: true             # false hides the UI button (callback stays available)
+  cookie_secure: true                 # set false for local HTTP dev only
+  cookie_key: ""                      # base64-encoded 32 bytes; set via NEXSPENCE_OIDC_COOKIE_KEY env var
+  allowed_skew_seconds: 60
+
+  # ── Keycloak example (bundled dev IdP from docker-compose.yml) ──────────────
+  # Uncomment and set enabled: true when running Keycloak via Docker Compose.
+  # Single-node (port 8081):
+  #   enabled: true
+  #   display_name: "Keycloak"
+  #   issuer: "http://keycloak:8080/realms/nexspence"
+  #   public_issuer_url: "http://localhost:8180/realms/nexspence"
+  #   client_id: "nexspence"
+  #   client_secret: "dev-oidc-secret-nexspence"
+  #   redirect_url: "http://localhost:8081/api/v1/auth/oidc/callback"
+  #   frontend_base_url: "http://localhost:8081"
+  #   cookie_secure: false
+  #   cookie_key: "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY="   # dev only!
+  #   admin_group: "nexspence-admins"
+  #   groups_claim: "groups"
+  #   scopes: ["openid", "profile", "email"]
+  #
+  # HA mode (port 8080 via nginx):
+  #   redirect_url: "http://localhost:8080/api/v1/auth/oidc/callback"
+  #   frontend_base_url: "http://localhost:8080"
+  #   (all other fields same as above)
+
+saml:
+  enabled: false
+  display_name: "SAML SSO"
+  show_login_button: true
+  frontend_base_url: "http://localhost:5173"
+  idp_metadata_url: ""
+  idp_metadata_xml: ""
+  sp_entity_id: ""
+  acs_url: ""
+  sp_cert_pem: ""
+  sp_key_pem: ""
+  provisioning: "jit"
+  email_allowlist: []
+  groups_attribute: "groups"
+  email_attribute: "email"
+  username_attribute: "uid"
+  name_attribute: "displayName"
+  admin_group: ""
+  role_mappings: {}
+  hmac_key: ""
+
+# Redis — required for multi-node (HA) deployments.
+# Set enabled: true when running multiple Nexspence instances behind a load balancer.
+# With enabled: false (default), the server runs fully without Redis.
+redis:
+  enabled: false
+  addr: "localhost:6379"
+  password: ""
+  db: 0

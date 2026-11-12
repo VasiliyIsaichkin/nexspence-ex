@@ -1,0 +1,467 @@
+package main
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/nexspence-oss/nexspence/internal/auth"
+	"github.com/nexspence-oss/nexspence/internal/config"
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/logger"
+	"github.com/nexspence-oss/nexspence/internal/testutil"
+)
+
+func testBootstrapCfg() config.BootstrapConfig {
+	return config.BootstrapConfig{
+		Enabled:        true,
+		AdminUsername:  "admin",
+		AdminPassword:  "admin123",
+		AdminEmail:     "admin@example.com",
+		AdminFirstName: "Admin",
+	}
+}
+
+func testAuthSvc() *auth.Service {
+	// bcrypt cost 4 (MinCost) keeps these tests fast.
+	return auth.NewService("test-secret-test-secret-test-1234", 8, 4)
+}
+
+func testS3Config() config.S3Config {
+	return config.S3Config{
+		Bucket:          "artifacts",
+		Region:          "us-east-1",
+		Endpoint:        "http://minio:9000",
+		AccessKeyID:     "minioadmin",
+		SecretAccessKey: "miniosecret",
+		ForcePathStyle:  true,
+	}
+}
+
+// assertS3Store fails unless bs is an s3 store whose config uses the registry's
+// expected key names (access_key/secret_key, NOT access_key_id) matching s3.
+func assertS3Store(t *testing.T, bs *domain.BlobStore, s3 config.S3Config) {
+	t.Helper()
+	if bs == nil {
+		t.Fatal("blob store is nil")
+	}
+	if bs.Type != "s3" {
+		t.Fatalf("type = %q, want s3", bs.Type)
+	}
+	want := map[string]any{
+		"bucket":           s3.Bucket,
+		"region":           s3.Region,
+		"endpoint":         s3.Endpoint,
+		"access_key":       s3.AccessKeyID,
+		"secret_key":       s3.SecretAccessKey,
+		"force_path_style": s3.ForcePathStyle,
+	}
+	for k, v := range want {
+		if bs.Config[k] != v {
+			t.Fatalf("config[%q] = %v, want %v", k, bs.Config[k], v)
+		}
+	}
+	if _, ok := bs.Config["access_key_id"]; ok {
+		t.Fatal("config must use registry key access_key, not access_key_id")
+	}
+}
+
+// Regression #81: with storage.default_type=s3 the seed migration still leaves
+// the "default"/"docker" blob stores as local, so repositories with no explicit
+// blobStoreId write to local disk. Reconcile must convert the seed stores to s3.
+func TestReconcileS3BlobStores_ConvertsSeedLocalToS3(t *testing.T) {
+	s3 := testS3Config()
+	blobs := testutil.NewBlobStoreRepo(
+		&domain.BlobStore{ID: "bs-default", Name: "default", Type: "local", Config: map[string]any{"path": "./data/blobs/default"}},
+		&domain.BlobStore{ID: "bs-docker", Name: "docker", Type: "local", Config: map[string]any{"path": "./data/blobs/docker"}},
+	)
+	log := logger.New("error", "json")
+
+	if err := reconcileS3BlobStores(context.Background(), blobs, s3, nil, log); err != nil {
+		t.Fatalf("reconcileS3BlobStores: %v", err)
+	}
+
+	def, _ := blobs.Get(context.Background(), "default")
+	assertS3Store(t, def, s3)
+	dock, _ := blobs.Get(context.Background(), "docker")
+	assertS3Store(t, dock, s3)
+}
+
+// Reconcile creates a seed store that is missing entirely.
+func TestReconcileS3BlobStores_CreatesMissing(t *testing.T) {
+	s3 := testS3Config()
+	blobs := testutil.NewBlobStoreRepo(
+		&domain.BlobStore{ID: "bs-default", Name: "default", Type: "local", Config: map[string]any{"path": "./data/blobs/default"}},
+	)
+	log := logger.New("error", "json")
+
+	if err := reconcileS3BlobStores(context.Background(), blobs, s3, nil, log); err != nil {
+		t.Fatalf("reconcileS3BlobStores: %v", err)
+	}
+
+	dock, err := blobs.Get(context.Background(), "docker")
+	if err != nil {
+		t.Fatalf("docker store not created: %v", err)
+	}
+	assertS3Store(t, dock, s3)
+}
+
+// Reconcile is idempotent: a second run leaves the already-reconciled stores
+// unchanged and returns no error.
+func TestReconcileS3BlobStores_Idempotent(t *testing.T) {
+	s3 := testS3Config()
+	blobs := testutil.NewBlobStoreRepo(
+		&domain.BlobStore{ID: "bs-default", Name: "default", Type: "local", Config: map[string]any{"path": "./data/blobs/default"}},
+	)
+	log := logger.New("error", "json")
+
+	for i := 0; i < 2; i++ {
+		if err := reconcileS3BlobStores(context.Background(), blobs, s3, nil, log); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+	def, _ := blobs.Get(context.Background(), "default")
+	assertS3Store(t, def, s3)
+}
+
+func testAzureConfig() config.AzureConfig {
+	return config.AzureConfig{
+		Container:        "nexspence-blobs",
+		AccountName:      "mystorage",
+		AccountKey:       "secret-key",
+		ConnectionString: "",
+		SASToken:         "",
+		Endpoint:         "https://mystorage.blob.core.windows.net",
+		SkipTLSVerify:    false,
+	}
+}
+
+func assertAzureStore(t *testing.T, bs *domain.BlobStore, az config.AzureConfig) {
+	t.Helper()
+	if bs == nil {
+		t.Fatal("blob store is nil")
+	}
+	if bs.Type != "azure" {
+		t.Fatalf("type = %q, want azure", bs.Type)
+	}
+	want := desiredAzureConfig(az)
+	for k, v := range want {
+		if bs.Config[k] != v {
+			t.Fatalf("config[%q] = %v, want %v", k, bs.Config[k], v)
+		}
+	}
+}
+
+func TestReconcileAzureBlobStores_ConvertsSeedLocalToAzure(t *testing.T) {
+	az := testAzureConfig()
+	blobs := testutil.NewBlobStoreRepo(
+		&domain.BlobStore{ID: "bs-default", Name: "default", Type: "local", Config: map[string]any{"path": "./data/blobs/default"}},
+		&domain.BlobStore{ID: "bs-docker", Name: "docker", Type: "local", Config: map[string]any{"path": "./data/blobs/docker"}},
+	)
+	log := logger.New("error", "json")
+
+	if err := reconcileAzureBlobStores(context.Background(), blobs, az, nil, log); err != nil {
+		t.Fatalf("reconcileAzureBlobStores: %v", err)
+	}
+
+	def, _ := blobs.Get(context.Background(), "default")
+	assertAzureStore(t, def, az)
+	dock, _ := blobs.Get(context.Background(), "docker")
+	assertAzureStore(t, dock, az)
+}
+
+func TestReconcileAzureBlobStores_CreatesMissing(t *testing.T) {
+	az := testAzureConfig()
+	blobs := testutil.NewBlobStoreRepo(
+		&domain.BlobStore{ID: "bs-default", Name: "default", Type: "local", Config: map[string]any{"path": "./data/blobs/default"}},
+	)
+	log := logger.New("error", "json")
+
+	if err := reconcileAzureBlobStores(context.Background(), blobs, az, nil, log); err != nil {
+		t.Fatalf("reconcileAzureBlobStores: %v", err)
+	}
+
+	dock, err := blobs.Get(context.Background(), "docker")
+	if err != nil {
+		t.Fatalf("docker store not created: %v", err)
+	}
+	assertAzureStore(t, dock, az)
+}
+
+func TestReconcileAzureBlobStores_Idempotent(t *testing.T) {
+	az := testAzureConfig()
+	blobs := testutil.NewBlobStoreRepo(
+		&domain.BlobStore{ID: "bs-default", Name: "default", Type: "local", Config: map[string]any{"path": "./data/blobs/default"}},
+	)
+	log := logger.New("error", "json")
+
+	for i := 0; i < 2; i++ {
+		if err := reconcileAzureBlobStores(context.Background(), blobs, az, nil, log); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+	def, _ := blobs.Get(context.Background(), "default")
+	assertAzureStore(t, def, az)
+}
+
+func TestReconcileAzureBlobStores_OccupiedSeedRejectedWithoutMutation(t *testing.T) {
+	az := testAzureConfig()
+	blobs := testutil.NewBlobStoreRepo(
+		&domain.BlobStore{ID: "bs-default", Name: "default", Type: "local",
+			Config: map[string]any{"path": "./data/blobs/default"}},
+		&domain.BlobStore{ID: "bs-docker", Name: "docker", Type: "local",
+			Config: map[string]any{"path": "./data/blobs/docker"}},
+	)
+	storeID := "bs-default"
+	refs := azureBlobStoreReferences{
+		repositories: testutil.NewRepoRepo(&domain.Repository{ID: "repo-1", Name: "default-repo", BlobStoreID: &storeID}),
+		assets:       testutil.NewAssetRepo(),
+	}
+	err := reconcileAzureBlobStoresWithReferences(context.Background(), blobs, refs, "./data/blobs", az, nil, logger.New("error", "json"))
+	if err == nil || !strings.Contains(err.Error(), `"default" is already used or referenced`) {
+		t.Fatalf("reconcileAzureBlobStores error = %v, want a clear target-change rejection", err)
+	}
+	def, _ := blobs.Get(context.Background(), "default")
+	if def.Type != "local" || def.Config["path"] != "./data/blobs/default" {
+		t.Fatalf("occupied default store was changed: %#v", def)
+	}
+	dock, _ := blobs.Get(context.Background(), "docker")
+	if dock.Type != "local" {
+		t.Fatalf("docker store changed despite preflight rejection: %#v", dock)
+	}
+}
+
+func TestReconcileAzureBlobStores_PreflightRejectionDoesNotPartiallyMutate(t *testing.T) {
+	az := testAzureConfig()
+	blobs := testutil.NewBlobStoreRepo(
+		&domain.BlobStore{ID: "bs-default", Name: "default", Type: "local",
+			Config: map[string]any{"path": "./data/blobs/default"}},
+		&domain.BlobStore{ID: "bs-docker", Name: "docker", Type: "local",
+			Config: map[string]any{"path": "/srv/nexspence/docker"}},
+	)
+	err := reconcileAzureBlobStoresWithReferences(context.Background(), blobs,
+		azureBlobStoreReferences{repositories: testutil.NewRepoRepo(), assets: testutil.NewAssetRepo()},
+		"./data/blobs", az, nil, logger.New("error", "json"))
+	if err == nil {
+		t.Fatal("reconcileAzureBlobStores unexpectedly succeeded")
+	}
+	def, _ := blobs.Get(context.Background(), "default")
+	if def.Type != "local" || def.Config["path"] != "./data/blobs/default" {
+		t.Fatalf("preflight rejection partially mutated default: %#v", def)
+	}
+}
+
+func TestReconcileAzureBlobStores_IndividualConfigurationRejected(t *testing.T) {
+	az := testAzureConfig()
+	blobs := testutil.NewBlobStoreRepo(&domain.BlobStore{ID: "bs-default", Name: "default", Type: "local",
+		Config: map[string]any{"path": "/srv/nexspence/custom-default"}})
+	err := reconcileAzureBlobStoresWithReferences(context.Background(), blobs,
+		azureBlobStoreReferences{repositories: testutil.NewRepoRepo(), assets: testutil.NewAssetRepo()},
+		"./data/blobs", az, nil, logger.New("error", "json"))
+	if err == nil || !strings.Contains(err.Error(), "individual configuration") {
+		t.Fatalf("error = %v, want individual-configuration rejection", err)
+	}
+	got, _ := blobs.Get(context.Background(), "default")
+	if got.Type != "local" || got.Config["path"] != "/srv/nexspence/custom-default" {
+		t.Fatalf("individual store configuration changed: %#v", got)
+	}
+}
+
+func TestReconcileAzureBlobStores_CredentialRotationAllowedForOccupiedStore(t *testing.T) {
+	old := testAzureConfig()
+	rotated := old
+	rotated.AccountKey = "rotated-secret"
+	blobs := testutil.NewBlobStoreRepo(&domain.BlobStore{
+		ID: "bs-default", Name: "default", Type: "azure", UsedBytes: 42,
+		Config: desiredAzureConfig(old),
+	})
+	storeID := "bs-default"
+	refs := azureBlobStoreReferences{
+		repositories: testutil.NewRepoRepo(&domain.Repository{ID: "repo-1", Name: "maven-hosted", BlobStoreID: &storeID}),
+		assets:       testutil.NewAssetRepo(),
+	}
+	if err := reconcileAzureBlobStoresWithReferences(context.Background(), blobs, refs, "./data/blobs", rotated, nil, logger.New("error", "json")); err != nil {
+		t.Fatalf("reconcileAzureBlobStores: %v", err)
+	}
+	got, _ := blobs.Get(context.Background(), "default")
+	assertAzureStore(t, got, rotated)
+	if got.UsedBytes != 42 {
+		t.Fatalf("credential rotation changed usage: %d", got.UsedBytes)
+	}
+}
+
+func TestReconcileAzureBlobStores_StorageTargetChangeRejectedForOccupiedAzureStore(t *testing.T) {
+	old := testAzureConfig()
+	changed := old
+	changed.Container = "different-container"
+	blobs := testutil.NewBlobStoreRepo(&domain.BlobStore{
+		ID: "bs-default", Name: "default", Type: "azure", UsedBytes: 42,
+		Config: desiredAzureConfig(old),
+	})
+	err := reconcileAzureBlobStoresWithReferences(context.Background(), blobs,
+		azureBlobStoreReferences{repositories: testutil.NewRepoRepo(), assets: testutil.NewAssetRepo()},
+		"./data/blobs", changed, nil, logger.New("error", "json"))
+	if err == nil || !strings.Contains(err.Error(), "different storage target") {
+		t.Fatalf("error = %v, want storage-target rejection", err)
+	}
+	got, _ := blobs.Get(context.Background(), "default")
+	assertAzureStore(t, got, old)
+}
+
+// Regression: a fresh deploy seeds the admin row with a placeholder hash (NOT
+// admin123). Bootstrap must apply the configured password so admin/admin123 can
+// log in. Previously bootstrap saw "admin already exists" and left the broken
+// placeholder in place.
+func TestEnsureBootstrapAdmin_SeedPlaceholder_PasswordApplied(t *testing.T) {
+	authSvc := testAuthSvc()
+	users := testutil.NewUserRepo(&domain.User{
+		ID:           "u-admin",
+		Username:     "admin",
+		PasswordHash: seedPlaceholderAdminHash,
+		Status:       domain.UserStatusActive,
+		Source:       domain.UserSourceLocal,
+	})
+	log := logger.New("error", "json")
+
+	if err := ensureBootstrapAdmin(context.Background(), users, testutil.NewRoleRepo(), authSvc, testBootstrapCfg(), log); err != nil {
+		t.Fatalf("ensureBootstrapAdmin: %v", err)
+	}
+
+	got, _ := users.Get(context.Background(), "admin")
+	if got.PasswordHash == seedPlaceholderAdminHash {
+		t.Fatal("password hash still the seed placeholder; configured password was not applied")
+	}
+	if err := authSvc.CheckPassword(got.PasswordHash, "admin123"); err != nil {
+		t.Fatalf("admin123 does not verify against the stored hash: %v", err)
+	}
+}
+
+// A genuinely changed admin password must never be clobbered by bootstrap
+// (preserves the #36 hardening intent: rotate via API, not config+restart).
+func TestEnsureBootstrapAdmin_ChangedPassword_NotModified(t *testing.T) {
+	authSvc := testAuthSvc()
+	custom, err := authSvc.HashPassword("operator-secret")
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	users := testutil.NewUserRepo(&domain.User{
+		ID:           "u-admin",
+		Username:     "admin",
+		PasswordHash: custom,
+		Status:       domain.UserStatusActive,
+	})
+	log := logger.New("error", "json")
+
+	if err := ensureBootstrapAdmin(context.Background(), users, testutil.NewRoleRepo(), authSvc, testBootstrapCfg(), log); err != nil {
+		t.Fatalf("ensureBootstrapAdmin: %v", err)
+	}
+
+	got, _ := users.Get(context.Background(), "admin")
+	if got.PasswordHash != custom {
+		t.Fatal("changed admin password was overwritten by bootstrap")
+	}
+	if err := authSvc.CheckPassword(got.PasswordHash, "admin123"); err == nil {
+		t.Fatal("admin123 must NOT verify against a changed password")
+	}
+}
+
+// No admin row at all: bootstrap creates one with the configured password and
+// the nx-admin role. (mock Get returns ErrNotFound, which must be treated as
+// "not found", not a hard error.)
+func TestEnsureBootstrapAdmin_Missing_Created(t *testing.T) {
+	authSvc := testAuthSvc()
+	users := testutil.NewUserRepo()
+	roles := testutil.NewRoleRepo(&domain.Role{ID: "r-admin", Name: "nx-admin"})
+	log := logger.New("error", "json")
+
+	if err := ensureBootstrapAdmin(context.Background(), users, roles, authSvc, testBootstrapCfg(), log); err != nil {
+		t.Fatalf("ensureBootstrapAdmin: %v", err)
+	}
+
+	got, err := users.Get(context.Background(), "admin")
+	if err != nil || got == nil {
+		t.Fatalf("admin not created: err=%v", err)
+	}
+	if err := authSvc.CheckPassword(got.PasswordHash, "admin123"); err != nil {
+		t.Fatalf("created admin password does not verify: %v", err)
+	}
+}
+
+// bootstrap.enabled=false is how an operator drops the admin credentials from
+// the config file for good (#243): the account is left entirely alone, even
+// though the shipped admin/admin123 defaults are still what config resolves to.
+func TestEnsureBootstrapAdmin_Disabled_NoAdminCreated(t *testing.T) {
+	authSvc := testAuthSvc()
+	users := testutil.NewUserRepo()
+	roles := testutil.NewRoleRepo(&domain.Role{ID: "r-admin", Name: "nx-admin"})
+	log := logger.New("error", "json")
+
+	b := testBootstrapCfg()
+	b.Enabled = false
+
+	if err := ensureBootstrapAdmin(context.Background(), users, roles, authSvc, b, log); err != nil {
+		t.Fatalf("ensureBootstrapAdmin: %v", err)
+	}
+
+	if got, err := users.Get(context.Background(), "admin"); err == nil && got != nil {
+		t.Fatal("admin user created even though bootstrap is disabled")
+	}
+}
+
+// Disabled bootstrap must not touch an existing admin either — not the seed
+// placeholder it would otherwise correct, and not a rotated password.
+func TestEnsureBootstrapAdmin_Disabled_ExistingAdminUntouched(t *testing.T) {
+	authSvc := testAuthSvc()
+	users := testutil.NewUserRepo(&domain.User{
+		ID:           "u-admin",
+		Username:     "admin",
+		PasswordHash: seedPlaceholderAdminHash,
+		Status:       domain.UserStatusActive,
+		Source:       domain.UserSourceLocal,
+	})
+	log := logger.New("error", "json")
+
+	b := testBootstrapCfg()
+	b.Enabled = false
+
+	if err := ensureBootstrapAdmin(context.Background(), users, testutil.NewRoleRepo(), authSvc, b, log); err != nil {
+		t.Fatalf("ensureBootstrapAdmin: %v", err)
+	}
+
+	got, _ := users.Get(context.Background(), "admin")
+	if got.PasswordHash != seedPlaceholderAdminHash {
+		t.Fatal("disabled bootstrap modified the admin password")
+	}
+}
+
+func TestReconcileAzureBlobStores_FreshSeeds_CustomLocalBasePath(t *testing.T) {
+	blobs := testutil.NewBlobStoreRepo(
+		&domain.BlobStore{ID: "default-id", Name: "default", Type: "local", Config: map[string]any{"path": "./data/blobs/default"}},
+		&domain.BlobStore{ID: "docker-id", Name: "docker", Type: "local", Config: map[string]any{"path": "./data/blobs/docker"}},
+	)
+	az := testAzureConfig()
+	err := reconcileAzureBlobStoresWithReferences(context.Background(), blobs, azureBlobStoreReferences{repositories: testutil.NewRepoRepo(), assets: testutil.NewAssetRepo()}, "/app/data/blobs", az, nil, logger.New("error", "json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range seedBlobStores {
+		bs, err := blobs.Get(context.Background(), name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertAzureStore(t, bs, az)
+	}
+}
+
+func TestAzureStorageTargetEqual_ConnectionStringOverridesSeparateFields(t *testing.T) {
+	old := map[string]any{"container": "blobs", "account_name": "ignored", "endpoint": "https://ignored.example", "connection_string": "DefaultEndpointsProtocol=https;AccountName=actual;AccountKey=YQ==;EndpointSuffix=core.windows.net"}
+	rotated := map[string]any{"container": "blobs", "account_name": "actual", "account_key": "rotated"}
+	if !azureConfigOnlyCredentialsDiffer(old, rotated) {
+		t.Fatal("credential switch with unchanged SDK endpoint rejected")
+	}
+	changed := cloneConfig(old)
+	changed["connection_string"] = "DefaultEndpointsProtocol=https;AccountName=actual;AccountKey=YQ==;EndpointSuffix=core.usgovcloudapi.net"
+	if azureConfigOnlyCredentialsDiffer(old, changed) {
+		t.Fatal("changed connection-string target accepted as credential rotation")
+	}
+}

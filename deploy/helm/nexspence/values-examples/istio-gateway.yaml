@@ -1,0 +1,29 @@
+# Istio API Gateway example
+# Prerequisites:
+#   - Istio installed: istioctl install --set profile=default
+#   - Namespace labeled: kubectl label namespace <ns> istio-injection=enabled
+
+ingress:
+  enabled: false
+
+gateway:
+  istio:
+    enabled: true
+    # Workload labels on the Gateway this file creates (spec.selector).
+    # To attach to a Gateway that already exists, use
+    # values-examples/istio-existing-gateway.yaml instead.
+    gatewaySelector:
+      istio: ingressgateway
+    port: 443
+    tlsMode: "SIMPLE"
+    # Secret must be in istio-system namespace (Istio reads certs from there)
+    tlsSecret: "nexspence-tls"
+    hosts:
+      - "nexspence.example.com"
+    timeout: "300s"
+    vsAnnotations: {}
+
+config:
+  baseURL: "https://nexspence.example.com"
+  jwtSecret: "replace-with-64-char-random-secret"
+  adminPassword: "replace-with-strong-password"

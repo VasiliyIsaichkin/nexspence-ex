@@ -1,0 +1,27 @@
+apiVersion: v2
+name: nexspence
+description: Nexspence — open-source universal artifact repository manager
+type: application
+version: 0.1.0
+appVersion: "latest"
+home: https://github.com/nexspence/nexspence
+sources:
+  - https://github.com/nexspence/nexspence
+keywords:
+  - artifact-repository
+  - nexus-alternative
+  - maven
+  - npm
+  - docker
+  - helm
+maintainers:
+  - name: nexspence
+dependencies:
+  - name: postgresql
+    version: "15.5.38"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: postgresql.enabled
+# Links the OCI package (ghcr.io/nexspence/charts/nexspence) back to the repo on GitHub.
+annotations:
+  org.opencontainers.image.source: https://github.com/nexspence/nexspence
+  org.opencontainers.image.licenses: AGPL-3.0-or-later

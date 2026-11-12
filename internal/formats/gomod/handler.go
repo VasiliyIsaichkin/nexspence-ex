@@ -1,0 +1,317 @@
+// Package gomod implements the GOPROXY protocol for Go module repositories.
+//
+// Endpoints (all under /repository/:repoName/):
+//
+//	GET /<module>/@v/list               → newline-separated version list
+//	GET /<module>/@v/<version>.info     → {"Version":"v1.0.0","Time":"2024-01-01T00:00:00Z"}
+//	GET /<module>/@v/<version>.mod      → go.mod content
+//	GET /<module>/@v/<version>.zip      → module source zip
+//	GET /<module>/@latest               → latest version info JSON
+//	PUT /<module>/@v/<version>.zip      → upload zip (Nexspence extension)
+//	PUT /<module>/@v/<version>.mod      → upload go.mod (Nexspence extension)
+package gomod
+
+import (
+	"context"
+	"net/http"
+	"path"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"golang.org/x/mod/module"
+	"golang.org/x/mod/semver"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/formats"
+	"github.com/nexspence-oss/nexspence/internal/formats/base"
+	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
+)
+
+// Handler serves the Go module proxy (GOPROXY) protocol.
+type Handler struct {
+	deps formats.Deps
+	// age caches upstream version times for the minimum-package-age policy
+	// (#643); see age_filter.go.
+	age ageCache
+}
+
+// New creates a Go module format Handler with the given dependencies.
+func New(deps formats.Deps) *Handler { return &Handler{deps: deps} }
+
+// Name returns the format identifier.
+func (h *Handler) Name() string { return "go" }
+
+func (h *Handler) ServeHTTP(c *gin.Context) {
+	p := normPath(c.Param("path"))
+	repoName := c.Param("repoName")
+
+	switch c.Request.Method {
+	case http.MethodGet, http.MethodHead:
+		h.handleGet(c, repoName, p)
+	case http.MethodPut:
+		repo, err := h.deps.Repos.Get(c.Request.Context(), repoName)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if repoproxy.RejectMutation(c, repo) {
+			return
+		}
+		h.handlePut(c, repoName, p)
+	default:
+		c.Status(http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleGet(c *gin.Context, repoName, p string) {
+	repo, err := h.deps.Repos.Get(c.Request.Context(), repoName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if repo != nil && repo.Type == domain.TypeProxy {
+		// @latest and @v/list resolve to a moving target (newest version / the full
+		// version list); @v/<ver>.{info,mod,zip} are immutable per version.
+		var maxAge time.Duration
+		if strings.HasSuffix(p, "/@latest") || strings.HasSuffix(p, "/@v/list") {
+			maxAge = repoproxy.MetadataMaxAge(repo)
+		}
+		var rewrite func([]byte) []byte
+		if minAge := repoproxy.MinimumPackageAge(repo); minAge > 0 {
+			if done := h.applyAgePolicy(c, repo, p, minAge, &rewrite); done {
+				return
+			}
+		}
+		if err := repoproxy.ServeGETRewritten(c, h.deps, repo, p, "", goProxyCoords(p), goContentType(p), maxAge, rewrite); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+
+	// GET /<module>/@latest
+	if strings.HasSuffix(p, "/@latest") {
+		modulePath := strings.TrimSuffix(strings.TrimPrefix(p, "/"), "/@latest")
+		h.serveLatest(c, repoName, modulePath)
+		return
+	}
+
+	// Find /@v/ split
+	atv := strings.Index(p, "/@v/")
+	if atv < 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "invalid Go module path"})
+		return
+	}
+	modulePath := strings.TrimPrefix(p[:atv], "/")
+	rest := p[atv+4:] // after /@v/
+
+	switch {
+	case rest == "list":
+		h.serveList(c, repoName, modulePath)
+	case strings.HasSuffix(rest, ".info"):
+		version := strings.TrimSuffix(rest, ".info")
+		h.serveInfo(c, repoName, modulePath, version)
+	case strings.HasSuffix(rest, ".mod"):
+		version := strings.TrimSuffix(rest, ".mod")
+		h.serveFile(c, repoName, p, modulePath, version, "go.mod")
+	case strings.HasSuffix(rest, ".zip"):
+		version := strings.TrimSuffix(rest, ".zip")
+		h.serveFile(c, repoName, p, modulePath, version, "zip")
+	default:
+		c.JSON(http.StatusNotFound, gin.H{"error": "unknown endpoint"})
+	}
+}
+
+// applyAgePolicy enforces minimum_package_age on a proxy GET. It reports
+// done when it has answered the request itself (@latest, or a refusal);
+// otherwise it may set rewrite to filter the @v/list body.
+func (h *Handler) applyAgePolicy(c *gin.Context, repo *domain.Repository, p string, minAge time.Duration, rewrite *func([]byte) []byte) (done bool) {
+	if modPrefix, ok := strings.CutSuffix(p, "/@latest"); ok {
+		h.serveLatestByAge(c, repo, modPrefix, minAge)
+		return true
+	}
+	atv := strings.Index(p, "/@v/")
+	if atv < 0 {
+		return false
+	}
+	modPrefix, rest := p[:atv], p[atv+len("/@v/"):]
+	if rest == "list" {
+		*rewrite = h.filterListRewrite(c.Request.Context(), repo, modPrefix, minAge)
+		return false
+	}
+	for _, suf := range []string{".info", ".mod", ".zip"} {
+		if escaped, ok := strings.CutSuffix(rest, suf); ok {
+			version, err := module.UnescapeVersion(escaped)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "invalid version"})
+				return true
+			}
+			return !h.versionAgeAllowed(c, repo, modPrefix, version, minAge)
+		}
+	}
+	return false
+}
+
+// moduleComponents returns the stored versions of exactly modulePath (one
+// version when version is set). Search matches substrings, which would list
+// repo/v2's versions under repo and stop at one page (#586).
+func (h *Handler) moduleComponents(ctx context.Context, repoName, modulePath, version string) ([]domain.Component, error) {
+	return base.ExactComponents(ctx, h.deps.Components, domain.SearchParams{
+		Repository: repoName,
+		Group:      modulePath,
+		Version:    version,
+	})
+}
+
+func (h *Handler) serveList(c *gin.Context, repoName, modulePath string) {
+	comps, err := h.moduleComponents(c.Request.Context(), repoName, modulePath, "")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	var sb strings.Builder
+	for _, comp := range comps {
+		sb.WriteString(comp.Version + "\n")
+	}
+	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(sb.String()))
+}
+
+func (h *Handler) serveInfo(c *gin.Context, repoName, modulePath, version string) {
+	comps, err := h.moduleComponents(c.Request.Context(), repoName, modulePath, version)
+	if err != nil || len(comps) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "version not found"})
+		return
+	}
+	comp := comps[0]
+	t := comp.CreatedAt
+	c.JSON(http.StatusOK, gin.H{
+		"Version": version,
+		"Time":    t.UTC().Format(time.RFC3339),
+	})
+}
+
+func (h *Handler) serveFile(c *gin.Context, repoName, filePath, _, _, kind string) {
+	rc, asset, err := base.FetchArtifact(c.Request.Context(), h.deps, repoName, filePath)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	defer func() { _ = rc.Close() }()
+	ct := "application/octet-stream"
+	if kind == "go.mod" {
+		ct = "text/plain; charset=utf-8"
+	}
+	c.DataFromReader(http.StatusOK, asset.SizeBytes, ct, rc, nil)
+}
+
+func (h *Handler) serveLatest(c *gin.Context, repoName, modulePath string) {
+	comps, err := h.moduleComponents(c.Request.Context(), repoName, modulePath, "")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	latest, ok := latestVersion(comps)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no versions found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"Version": latest.Version,
+		"Time":    latest.CreatedAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// latestVersion picks what the go command would: the highest release, else
+// the highest +incompatible release, else the highest prerelease (every
+// pseudo-version is one). Versions that are not valid semver are skipped.
+func latestVersion(comps []domain.Component) (domain.Component, bool) {
+	rank := func(v string) int {
+		switch {
+		case semver.Prerelease(v) != "":
+			return 0
+		case semver.Build(v) == "+incompatible":
+			return 1
+		default:
+			return 2
+		}
+	}
+	var best domain.Component
+	bestRank := -1
+	for _, comp := range comps {
+		v := comp.Version
+		if !semver.IsValid(v) {
+			continue
+		}
+		r := rank(v)
+		if r > bestRank || (r == bestRank && semver.Compare(v, best.Version) > 0) {
+			best, bestRank = comp, r
+		}
+	}
+	return best, bestRank >= 0
+}
+
+func (h *Handler) handlePut(c *gin.Context, repoName, p string) {
+	ct := goContentType(p)
+	atv := strings.Index(p, "/@v/")
+	coords := base.Coords{}
+	if atv >= 0 {
+		modulePath := strings.TrimPrefix(p[:atv], "/")
+		rest := p[atv+4:]
+		coords.Group = modulePath
+		coords.Name = path.Base(modulePath)
+		for _, suf := range []string{".zip", ".mod", ".info"} {
+			if strings.HasSuffix(rest, suf) {
+				coords.Version = strings.TrimSuffix(rest, suf)
+				break
+			}
+		}
+	}
+	if _, err := base.StoreArtifact(c.Request.Context(), h.deps,
+		repoName, p, ct, coords, c.Request.Body, c.Request.ContentLength); err != nil {
+		c.JSON(base.HTTPStatusForError(err), gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"ok": true})
+}
+
+func goContentType(p string) string {
+	switch {
+	case strings.HasSuffix(p, ".zip"):
+		return "application/zip"
+	case strings.HasSuffix(p, ".mod"):
+		return "text/plain; charset=utf-8"
+	case strings.HasSuffix(p, ".info"):
+		return "application/json"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+func normPath(p string) string {
+	return path.Clean("/" + strings.TrimPrefix(p, "/"))
+}
+
+// goProxyCoords builds stable component coordinates for a GOPROXY path under a proxy repo.
+func goProxyCoords(pathStr string) base.Coords {
+	pathStr = strings.TrimPrefix(path.Clean("/"+strings.TrimPrefix(pathStr, "/")), "/")
+	if strings.HasSuffix(pathStr, "/@latest") {
+		mod := strings.TrimSuffix(pathStr, "/@latest")
+		return base.Coords{Group: mod, Name: "latest", Version: "0"}
+	}
+	i := strings.Index(pathStr, "/@v/")
+	if i < 0 {
+		return base.Coords{Group: pathStr, Name: "unknown", Version: "0"}
+	}
+	mod := pathStr[:i]
+	rest := pathStr[i+len("/@v/"):]
+	if rest == "list" {
+		return base.Coords{Group: mod, Name: "list", Version: "0"}
+	}
+	for _, suf := range []string{".info", ".mod", ".zip"} {
+		if strings.HasSuffix(rest, suf) {
+			ver := strings.TrimSuffix(rest, suf)
+			return base.Coords{Group: mod, Name: strings.TrimPrefix(suf, "."), Version: ver}
+		}
+	}
+	return base.Coords{Group: mod, Name: rest, Version: "0"}
+}

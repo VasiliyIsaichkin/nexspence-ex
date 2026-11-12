@@ -1,0 +1,60 @@
+package repository
+
+import "errors"
+
+// ErrNotFound is returned by repository lookup methods (Get/GetByID/GetByName/…)
+// when no matching row exists. Callers should test for it with errors.Is and
+// translate it into the appropriate not-found behavior (e.g. HTTP 404).
+var ErrNotFound = errors.New("not found")
+
+// ErrAlreadyExists is returned by repository write methods when the row would
+// violate a uniqueness constraint (e.g. a second user with the same email).
+// Callers translate it into the appropriate conflict behavior (e.g. HTTP 409)
+// rather than letting a raw driver error surface as a 500 carrying SQL internals.
+var ErrAlreadyExists = errors.New("already exists")
+
+// ErrInUse is returned by repository write methods when a delete would
+// violate a foreign-key constraint — the row is still referenced. Callers
+// translate it into HTTP 409 rather than letting a raw driver error surface
+// as a 500 carrying SQLSTATE.
+var ErrInUse = errors.New("still in use")
+
+// UniqueViolationError is an ErrAlreadyExists that names the field which
+// collided, so callers can report which one without parsing driver text.
+type UniqueViolationError struct {
+	Field string
+}
+
+func (e *UniqueViolationError) Error() string { return e.Field + " already exists" }
+
+// Is makes every UniqueViolationError match ErrAlreadyExists, so callers that
+// only care that the row exists can test for the sentinel.
+func (e *UniqueViolationError) Is(target error) bool { return target == ErrAlreadyExists }
+
+// InUseError is an ErrInUse that names the blocking foreign-key constraint,
+// so callers can say what still holds the row without parsing driver text.
+type InUseError struct {
+	Constraint string
+}
+
+func (e *InUseError) Error() string {
+	if e.Constraint == "" {
+		return "resource is still in use"
+	}
+	return "resource is still in use (" + e.Constraint + ")"
+}
+
+// Is makes every InUseError match ErrInUse, so callers that only care that
+// the row is referenced can test for the sentinel.
+func (e *InUseError) Is(target error) bool { return target == ErrInUse }
+
+// RequestNotPendingError is returned by WithPendingRequestLock when the locked
+// promotion request already left the pending state — typically because a
+// concurrent reviewer got there first. It carries the status that reviewer set.
+type RequestNotPendingError struct {
+	Status string
+}
+
+func (e *RequestNotPendingError) Error() string {
+	return "request is not pending (status: " + e.Status + ")"
+}

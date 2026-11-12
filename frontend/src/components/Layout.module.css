@@ -1,0 +1,405 @@
+.root {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  height: 100vh;
+  overflow: hidden;
+  transition: grid-template-columns 0.2s cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.root.collapsed {
+  grid-template-columns: 48px minmax(0, 1fr);
+}
+
+.sidebar {
+  height: 100vh;
+  background: var(--holo-surface-sidebar);
+  backdrop-filter: blur(30px);
+  border-right: 1px solid rgba(124,92,255,0.15);
+  padding: 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+  z-index: 20;
+  transition: padding 0.2s cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.navScrollArea {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--holo-c-blue) rgba(var(--holo-ink-rgb), 0.03);
+}
+
+.root.collapsed .sidebar {
+  padding: 14px 4px;
+}
+
+.root.collapsed .commandBar {
+  justify-content: center;
+  background: transparent;
+  border-color: transparent;
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+}
+
+.root.collapsed .commandBarUser {
+  opacity: 0;
+  max-width: 0;
+  padding: 0;
+}
+
+.root.collapsed .commandBarSep {
+  opacity: 0;
+  max-width: 0;
+}
+
+.root.collapsed .commandBarAction {
+  opacity: 0;
+  max-width: 0;
+}
+
+.root.collapsed .collapseButton {
+  padding: 0 2px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 8px 6px;
+}
+
+.brandLogo {
+  width: 180px;
+  height: auto;
+  display: block;
+}
+
+.brandLogoMini {
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  display: block;
+}
+
+.sectionLabel {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--holo-text-faint);
+  padding: 0 4px;
+  margin-top: 4px;
+  max-height: 20px;
+  overflow: hidden;
+  transition: opacity 0.15s, max-height 0.2s cubic-bezier(0.23, 1, 0.32, 1), margin 0.2s, padding 0.2s;
+}
+
+.root.collapsed .sectionLabel {
+  opacity: 0;
+  max-height: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.sectionLabelDocs {
+  color: var(--holo-tx-cyan-45);
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.navBtn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 11px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--holo-text-dim);
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, padding 0.2s, gap 0.2s, justify-content 0.2s;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.navLabel {
+  white-space: nowrap;
+  overflow: hidden;
+  max-width: 200px;
+  transition: opacity 0.15s, max-width 0.2s cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.root.collapsed .navLabel {
+  opacity: 0;
+  max-width: 0;
+}
+
+.root.collapsed .navBtn {
+  justify-content: center;
+  padding: 8px 6px;
+  gap: 0;
+}
+
+.navBtn:hover {
+  background: rgba(var(--holo-ink-rgb), 0.04);
+  color: var(--holo-text);
+}
+
+.navBtn.active {
+  background: linear-gradient(90deg, rgba(124,92,255,0.18), rgba(34,211,238,0.06));
+  border-color: rgba(124,92,255,0.30);
+  color: var(--holo-text);
+  font-weight: 600;
+}
+
+.navBtnDocs {
+  background: rgba(34,211,238,0.04);
+  border-color: rgba(34,211,238,0.12);
+  color: var(--holo-tx-cyan-80);
+}
+
+.navBtnDocs:hover {
+  background: rgba(34,211,238,0.08);
+  color: var(--holo-tx-cyan-95);
+}
+
+.navBtnDocs.active {
+  background: rgba(34,211,238,0.12);
+  border-color: rgba(34,211,238,0.35);
+  color: var(--holo-tx-cyan-100);
+}
+
+.divider {
+  border: none;
+  border-top: 1px solid rgba(124,92,255,0.15);
+  margin: 2px 0;
+}
+
+.commandBar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 999px;
+  border: 1px solid rgba(124,92,255,0.22);
+  background: rgba(124,92,255,0.05);
+  padding: 3px;
+  margin-top: 8px;
+  flex-shrink: 0;
+  transition: justify-content 0.2s;
+}
+
+.commandBarAvatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--holo-a), var(--holo-b));
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.commandBarAvatar:hover {
+  opacity: 0.85;
+}
+
+.commandBarUser {
+  flex: 1;
+  padding: 0 8px;
+  min-width: 0;
+  overflow: hidden;
+  transition: opacity 0.15s, max-width 0.2s cubic-bezier(0.23, 1, 0.32, 1), padding 0.2s;
+}
+
+.commandBarUserName {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--holo-text);
+  /* Clipping comes from <Truncated>, which also decides whether the value is
+     worth a tooltip. Re-adding it here would clip without ever revealing. */
+  display: block;
+}
+
+.commandBarUserRole {
+  font-size: 9px;
+  color: var(--holo-tx-purple-90);
+  display: block;
+}
+
+.commandBarSep {
+  width: 1px;
+  max-width: 1px;
+  height: 20px;
+  background: rgba(124,92,255,0.22);
+  flex-shrink: 0;
+  transition: opacity 0.15s, max-width 0.15s;
+}
+
+.commandBarAction {
+  width: 28px;
+  height: 28px;
+  max-width: 28px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(var(--holo-ink-rgb), 0.05);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  cursor: pointer;
+  color: var(--holo-tx-fg-40);
+  transition: color 0.15s, background 0.15s, opacity 0.15s, max-width 0.15s;
+}
+
+.commandBarAction:hover {
+  color: var(--holo-tx-fg-80);
+  background: rgba(var(--holo-ink-rgb), 0.12);
+}
+
+.commandBarActionDanger {
+  background: rgba(239,68,68,0.08);
+  color: var(--holo-tx-red-65);
+}
+
+.commandBarActionDanger:hover {
+  background: rgba(239,68,68,0.18);
+  color: var(--holo-tx-red-90);
+}
+
+/* Theme toggle + collapse button. Side by side when expanded; stacked in the
+   48px collapsed rail, where they would not fit next to each other. */
+.footerRow {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.root.collapsed .footerRow {
+  flex-direction: column;
+}
+
+.themeToggle {
+  width: 34px;
+  height: 26px;
+  border-radius: 8px;
+  border: 1px solid rgba(124,92,255,0.15);
+  background: rgba(124,92,255,0.04);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--holo-tx-purple-80);
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.root.collapsed .themeToggle {
+  width: 100%;
+}
+
+.themeToggle:hover {
+  background: rgba(124,92,255,0.10);
+  border-color: rgba(124,92,255,0.3);
+}
+
+.themeToggle:focus-visible {
+  outline: 2px solid var(--holo-c-blue);
+  outline-offset: 2px;
+}
+
+.collapseButton {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  height: 26px;
+  border-radius: 8px;
+  border: 1px solid rgba(124,92,255,0.15);
+  background: rgba(124,92,255,0.04);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--holo-tx-purple-45);
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.collapseButton:hover {
+  background: rgba(124,92,255,0.10);
+  color: var(--holo-tx-purple-80);
+  border-color: rgba(124,92,255,0.3);
+}
+
+.collapseButton:focus-visible {
+  outline: 2px solid var(--holo-c-blue);
+  outline-offset: 2px;
+}
+
+
+.version {
+  text-align: center;
+  font-size: 8px;
+  color: var(--holo-tx-fg-17);
+  padding: 3px 0 2px;
+  overflow: hidden;
+  max-height: 20px;
+  transition: opacity 0.15s, max-height 0.2s, padding 0.2s;
+}
+
+.root.collapsed .version {
+  opacity: 0;
+  max-height: 0;
+  padding: 0;
+}
+
+
+.main {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.skipLink {
+  position: absolute;
+  left: -999em;
+  top: -999em;
+  z-index: 200;
+  background: var(--holo-c-navy);
+  color: var(--holo-c-slate-200);
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  text-decoration: none;
+  font-size: 0.875rem;
+}
+.skipLink:focus {
+  left: 1rem;
+  top: 1rem;
+}
+
+.navBtn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--holo-c-blue);
+  border-radius: 8px;
+}

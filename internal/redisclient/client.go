@@ -1,0 +1,105 @@
+package redisclient
+
+import (
+	"context"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	nexspencecfg "github.com/nexspence-oss/nexspence/internal/config"
+)
+
+// Client wraps go-redis with the subset of operations Nexspence needs.
+type Client struct {
+	rdb *redis.Client
+}
+
+// New connects to Redis using cfg. Returns an error if the connection cannot be
+// established. Callers should check cfg.Enabled before calling New.
+func New(cfg nexspencecfg.RedisConfig) (*Client, error) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     cfg.Addr,
+		Password: cfg.Password,
+		DB:       cfg.DB,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
+		return nil, err
+	}
+	return &Client{rdb: rdb}, nil
+}
+
+// Get returns the value stored at key.
+func (c *Client) Get(ctx context.Context, key string) (string, error) {
+	return c.rdb.Get(ctx, key).Result()
+}
+
+// Set stores value at key with the given TTL.
+func (c *Client) Set(ctx context.Context, key, value string, ttl time.Duration) error {
+	return c.rdb.Set(ctx, key, value, ttl).Err()
+}
+
+// SetNX sets key=value with TTL only if the key does not exist.
+// Returns true if the key was set, false if it already existed.
+func (c *Client) SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	return c.rdb.SetNX(ctx, key, value, ttl).Result()
+}
+
+// Del deletes key.
+func (c *Client) Del(ctx context.Context, key string) error {
+	return c.rdb.Del(ctx, key).Err()
+}
+
+// delIfMatchScript is the classic Redlock compare-and-delete: a lock holder may
+// only drop the key while it still carries that holder's own token.
+var delIfMatchScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("DEL", KEYS[1])
+else
+	return 0
+end
+`)
+
+// DelIfMatch atomically deletes key only if it currently holds value.
+// Returns true if the key was deleted, false if it was missing or held a
+// different value.
+func (c *Client) DelIfMatch(ctx context.Context, key, value string) (bool, error) {
+	n, err := delIfMatchScript.Run(ctx, c.rdb, []string{key}, value).Int64()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// expireIfMatchScript is the refresh counterpart of delIfMatchScript: a lock
+// holder may only extend the key's TTL while it still carries its own token.
+var expireIfMatchScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+else
+	return 0
+end
+`)
+
+// ExpireIfMatch atomically resets key's TTL only if it currently holds value.
+// Returns true if the TTL was reset, false if the key was missing or held a
+// different value.
+func (c *Client) ExpireIfMatch(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	n, err := expireIfMatchScript.Run(ctx, c.rdb, []string{key}, value, ttl.Milliseconds()).Int64()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// Ping checks connectivity to Redis.
+func (c *Client) Ping(ctx context.Context) error {
+	return c.rdb.Ping(ctx).Err()
+}
+
+// Close releases the underlying Redis connection pool.
+func (c *Client) Close() error {
+	return c.rdb.Close()
+}

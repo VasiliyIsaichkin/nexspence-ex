@@ -1,0 +1,729 @@
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
+import { screen, waitFor, fireEvent, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { http, HttpResponse } from '@/test/msw/http'
+import UsersPage from './UsersPage'
+import { renderWithProviders, seedAuthAsAdmin } from '@/test/renderUtils'
+import { server } from '@/test/msw/server'
+import { useAuthStore } from '@/store/authStore'
+import { fixtures } from '@/test/fixtures'
+
+const userItem = (overrides?: Record<string, unknown>) => ({
+  id: 'u-1',
+  userId: 'alice',
+  emailAddress: 'alice@test.com',
+  firstName: 'Alice',
+  lastName: 'Smith',
+  status: 'active',
+  source: 'local',
+  roles: ['nx-admin'],
+  ...overrides,
+})
+
+const roleItem = (overrides?: Record<string, unknown>) => ({
+  id: 'role-admin',
+  name: 'nx-admin',
+  description: 'Administrator role',
+  readOnly: true,
+  privileges: [],
+  roles: [],
+  ...overrides,
+})
+
+describe('UsersPage', () => {
+  beforeEach(() => {
+    seedAuthAsAdmin()
+    server.use(
+      http.get('/service/rest/v1/security/users', () =>
+        HttpResponse.json([userItem(), userItem({ id: 'u-2', userId: 'bob', emailAddress: 'bob@test.com', firstName: 'Bob', lastName: '', status: 'disabled', roles: [] })]),
+      ),
+      http.get('/service/rest/v1/security/roles', () =>
+        HttpResponse.json([
+          roleItem(),
+          roleItem({ id: 'role-dev', name: 'developer', description: 'Dev role', readOnly: false }),
+        ]),
+      ),
+    )
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('renders the users list', async () => {
+    renderWithProviders(<UsersPage />)
+    expect(await screen.findByText('alice')).toBeInTheDocument()
+    expect(screen.getByText('bob')).toBeInTheDocument()
+    expect(screen.getByText('2 users')).toBeInTheDocument()
+    expect(screen.getByText('alice@test.com')).toBeInTheDocument()
+  })
+
+  it('filters users by the filter input', async () => {
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    const filter = screen.getByPlaceholderText('Filter by username or email…')
+    await userEvent.type(filter, 'bob')
+    await waitFor(() => expect(screen.queryByText('alice')).not.toBeInTheDocument())
+    expect(screen.getByText('bob')).toBeInTheDocument()
+  })
+
+  it('shows empty state when no users match', async () => {
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    const filter = screen.getByPlaceholderText('Filter by username or email…')
+    await userEvent.type(filter, 'zzznotfound')
+    expect(await screen.findByText('No users found')).toBeInTheDocument()
+  })
+
+  it('shows an error state when the users query fails', async () => {
+    server.use(
+      http.get('/service/rest/v1/security/users', () =>
+        HttpResponse.json({ error: 'boom users' }, { status: 500 }),
+      ),
+    )
+    renderWithProviders(<UsersPage />)
+    expect(await screen.findByText('boom users')).toBeInTheDocument()
+  })
+
+  it('opens the create-user modal, fills it and submits', async () => {
+    const user = userEvent.setup()
+    let posted: Record<string, unknown> | null = null
+    server.use(
+      http.post('/service/rest/v1/security/users', async ({ request }) => {
+        posted = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json(userItem(), { status: 201 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getByRole('button', { name: /Add User/ }))
+    const heading = await screen.findByRole('heading', { name: 'Add User' })
+    const form = heading.parentElement!.querySelector('form')!
+
+    const usernameInput = within(form).getByText('Username *').parentElement!.querySelector('input') as HTMLInputElement
+    await user.type(usernameInput, 'charlie')
+    const pwd = form.querySelector('input[type="password"]') as HTMLInputElement
+    await user.type(pwd, 's3cret-pw')
+
+    const submit = form.querySelector('button[type="submit"]') as HTMLButtonElement
+    await user.click(submit)
+    await waitFor(() => expect(posted).toBeTruthy())
+    expect((posted! as { userId: string }).userId).toBe('charlie')
+  })
+
+  it('selects a status via the custom Select in the create modal', async () => {
+    const user = userEvent.setup()
+    let posted: Record<string, unknown> | null = null
+    server.use(
+      http.post('/service/rest/v1/security/users', async ({ request }) => {
+        posted = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json(userItem(), { status: 201 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getByRole('button', { name: /Add User/ }))
+    await screen.findByRole('heading', { name: 'Add User' })
+
+    // Open the status Select (its trigger shows the current "Active" label)
+    await user.click(screen.getByRole('button', { name: /Active/ }))
+    await user.click(await screen.findByText('Disabled'))
+
+    const heading = screen.getByRole('heading', { name: 'Add User' })
+    const form = heading.parentElement!.querySelector('form')!
+    const usernameInput = within(form).getByText('Username *').parentElement!.querySelector('input') as HTMLInputElement
+    await user.type(usernameInput, 'dave')
+    const pwd = form.querySelector('input[type="password"]') as HTMLInputElement
+    await user.type(pwd, 'pw-long-enough')
+    await user.click(form.querySelector('button[type="submit"]') as HTMLButtonElement)
+    await waitFor(() => expect(posted).toBeTruthy())
+    expect((posted! as { status: string }).status).toBe('disabled')
+  })
+
+  it('shows an error when create user fails', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.post('/service/rest/v1/security/users', () =>
+        HttpResponse.json({ error: 'username taken' }, { status: 400 }),
+      ),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getByRole('button', { name: /Add User/ }))
+    const heading = await screen.findByRole('heading', { name: 'Add User' })
+    const form = heading.parentElement!.querySelector('form')!
+    const usernameInput = within(form).getByText('Username *').parentElement!.querySelector('input') as HTMLInputElement
+    await user.type(usernameInput, 'charlie')
+    const pwd = form.querySelector('input[type="password"]') as HTMLInputElement
+    await user.type(pwd, 's3cret-pw')
+    await user.click(form.querySelector('button[type="submit"]') as HTMLButtonElement)
+    expect(await screen.findByText('username taken')).toBeInTheDocument()
+  })
+
+  it('closes the create modal via Cancel', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getByRole('button', { name: /Add User/ }))
+    await screen.findByRole('heading', { name: 'Add User' })
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() =>
+      expect(screen.queryByRole('heading', { name: 'Add User' })).not.toBeInTheDocument(),
+    )
+  })
+
+  it('deletes a user after confirm', async () => {
+    let deleted = false
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    server.use(
+      http.delete('/service/rest/v1/security/users/:userId', () => {
+        deleted = true
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('bob')
+    // bob is not admin -> delete button enabled
+    const bobRow = screen.getByText('bob').closest('div[style]')!.parentElement!.parentElement as HTMLElement
+    const delBtn = within(bobRow).getByTitle('Delete user')
+    fireEvent.click(delBtn)
+    await waitFor(() => expect(deleted).toBe(true))
+  })
+
+  // #667: an SSO administrator must be able to retire the local bootstrap
+  // account, including the default username that was hardcoded as undeletable.
+  it.each(['admin', 'initial-admin'])('lets an SSO administrator delete the local %s account', async (username) => {
+    useAuthStore.setState({ user: fixtures.user({ username: 'keycloak-admin', source: 'oidc' }) })
+    let deletedUsername = ''
+    let users = [userItem({ userId: username }), userItem({ id: 'sso', userId: 'keycloak-admin', source: 'oidc' })]
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    server.use(
+      http.get('/service/rest/v1/security/users', () => HttpResponse.json(users)),
+      http.delete('/service/rest/v1/security/users/:userId', ({ params }) => {
+        deletedUsername = String(params.userId)
+        users = users.filter(u => u.userId !== deletedUsername)
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText(username)
+    const row = screen.getByText(username).closest('div[style]')!.parentElement!.parentElement as HTMLElement
+    const button = within(row).getByTitle('Delete user')
+    expect(button).toBeEnabled()
+    await userEvent.click(button)
+    await waitFor(() => expect(deletedUsername).toBe(username))
+    await waitFor(() => expect(screen.queryByText(username)).not.toBeInTheDocument())
+    expect(screen.getByText('keycloak-admin')).toBeInTheDocument()
+  })
+
+  it.each([['admin', 'local'], ['keycloak-admin', 'oidc']])('prevents deleting the signed-in %s account', async (username, source) => {
+    useAuthStore.setState({ user: fixtures.user({ username, source }) })
+    server.use(http.get('/service/rest/v1/security/users', () =>
+      HttpResponse.json([userItem({ userId: username, source })]),
+    ))
+    renderWithProviders(<UsersPage />)
+    await screen.findByText(username)
+    expect(screen.getByTitle('Delete user')).toBeDisabled()
+  })
+
+  it('warns before deleting a local account that bootstrap can recreate it', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('bob')
+    await userEvent.click(screen.getAllByTitle('Delete user')[1])
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('bootstrap.enabled: false'))
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('restart'))
+  })
+
+  it('shows the API error when deleting a user fails', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    server.use(http.delete('/service/rest/v1/security/users/:userId', () =>
+      HttpResponse.json({ error: 'Deletion denied by policy' }, { status: 403 }),
+    ))
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('bob')
+    await userEvent.click(screen.getAllByTitle('Delete user')[1])
+    expect(await screen.findByRole('alert')).toHaveTextContent('Deletion denied by policy')
+    expect(screen.getByText('bob')).toBeInTheDocument()
+  })
+
+  it('does not delete when confirm is cancelled', async () => {
+    let deleted = false
+    vi.spyOn(window, 'confirm').mockReturnValue(false)
+    server.use(
+      http.delete('/service/rest/v1/security/users/:userId', () => {
+        deleted = true
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('bob')
+    const delBtns = screen.getAllByTitle('Delete user')
+    // Click bob's (second) delete button
+    fireEvent.click(delBtns[1])
+    await new Promise(r => setTimeout(r, 50))
+    expect(deleted).toBe(false)
+  })
+
+  it('opens the assign-roles modal, filters, toggles and saves', async () => {
+    const user = userEvent.setup()
+    let putBody: Record<string, unknown> | null = null
+    server.use(
+      http.put('/service/rest/v1/security/users/:userId/roles', async ({ request }) => {
+        putBody = (await request.json()) as Record<string, unknown>
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    // open alice's assign-roles modal (first Assign roles button)
+    const assignBtns = screen.getAllByTitle('Assign roles')
+    await user.click(assignBtns[0])
+    expect(await screen.findByText(/Assign Roles — alice/)).toBeInTheDocument()
+
+    // alice already has nx-admin (selected). developer is available.
+    expect(screen.getByText('developer')).toBeInTheDocument()
+    // Filter the Available list
+    const filters = screen.getAllByPlaceholderText('Filter…')
+    await user.type(filters[0], 'dev')
+    expect(screen.getByText('developer')).toBeInTheDocument()
+
+    // Add developer (click the available item)
+    await user.click(screen.getByText('developer'))
+
+    // Save
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(putBody).toBeTruthy())
+    expect((putBody! as { roleIds: string[] }).roleIds).toContain('role-dev')
+  })
+
+  it('add-all and remove-all arrows in the assign-roles modal', async () => {
+    const user = userEvent.setup()
+    let putBody: Record<string, unknown> | null = null
+    server.use(
+      http.put('/service/rest/v1/security/users/:userId/roles', async ({ request }) => {
+        putBody = (await request.json()) as Record<string, unknown>
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getAllByTitle('Assign roles')[0])
+    await screen.findByText(/Assign Roles — alice/)
+
+    await user.click(screen.getByTitle('Add all'))
+    await user.click(screen.getByTitle('Remove all'))
+    expect(screen.getByText('None selected')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(putBody).toBeTruthy())
+    expect((putBody! as { roleIds: string[] }).roleIds).toEqual([])
+  })
+
+  // #570: saving roles for "bob#2" must not re-assign the roles of "bob".
+  it('saves roles for a user whose id contains # by the full id', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.get('/service/rest/v1/security/users', () =>
+        HttpResponse.json([userItem({ id: 'u-9', userId: 'bob#2', emailAddress: 'bob2@test.com' })]),
+      ),
+    )
+    let putUrl = ''
+    server.use(
+      http.put('/service/rest/v1/security/users/:userId/roles', ({ request }) => {
+        putUrl = request.url
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('bob#2')
+    await user.click(screen.getAllByTitle('Assign roles')[0])
+    await screen.findByText(/Assign Roles — bob#2/)
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(putUrl).toMatch(/\/security\/users\/bob%232\/roles$/))
+  })
+
+  it('shows an error when saving roles fails', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.put('/service/rest/v1/security/users/:userId/roles', () =>
+        HttpResponse.json({ error: 'cannot save roles' }, { status: 500 }),
+      ),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getAllByTitle('Assign roles')[0])
+    await screen.findByText(/Assign Roles — alice/)
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByText('cannot save roles')).toBeInTheDocument()
+  })
+
+  // #571: the modal must not start from an empty selection just because the
+  // roles list had not arrived yet — PUT .../roles replaces the user's roles.
+  it('keeps Save disabled until the roles load, then starts from the user roles', async () => {
+    const user = userEvent.setup()
+    let release!: () => void
+    const held = new Promise<void>(r => { release = r })
+    let putBody: { roleIds: string[] } | null = null
+    server.use(
+      http.get('/service/rest/v1/security/roles', async () => {
+        await held
+        return HttpResponse.json([
+          roleItem(),
+          roleItem({ id: 'role-dev', name: 'developer', description: 'Dev role', readOnly: false }),
+        ])
+      }),
+      http.put('/service/rest/v1/security/users/:userId/roles', async ({ request }) => {
+        putBody = (await request.json()) as { roleIds: string[] }
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getAllByTitle('Assign roles')[0])
+    await screen.findByText(/Assign Roles — alice/)
+    expect(screen.getByText('Loading roles…')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+
+    release()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled())
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(putBody).toBeTruthy())
+    expect(putBody!.roleIds).toEqual(['role-admin'])
+  })
+
+  it('keeps Save disabled when the roles fail to load', async () => {
+    const user = userEvent.setup()
+    let put = false
+    server.use(
+      http.get('/service/rest/v1/security/roles', () =>
+        HttpResponse.json({ error: 'boom' }, { status: 500 }),
+      ),
+      http.put('/service/rest/v1/security/users/:userId/roles', () => {
+        put = true
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getAllByTitle('Assign roles')[0])
+    await screen.findByText(/Assign Roles — alice/)
+    expect(await screen.findByText('Failed to load roles')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(put).toBe(false)
+  })
+
+  it('closes the assign-roles modal via Cancel', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getAllByTitle('Assign roles')[0])
+    await screen.findByText(/Assign Roles — alice/)
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() =>
+      expect(screen.queryByText(/Assign Roles — alice/)).not.toBeInTheDocument(),
+    )
+  })
+
+  it('refreshes the user list via the refresh button', async () => {
+    let calls = 0
+    server.use(
+      http.get('/service/rest/v1/security/users', () => {
+        calls++
+        return HttpResponse.json([userItem()])
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    const initial = calls
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(calls).toBeGreaterThan(initial))
+  })
+
+  /* ── Roles tab ── */
+  it('switches to Roles tab and lists roles', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getByRole('button', { name: 'Roles' }))
+    expect(await screen.findByText('developer')).toBeInTheDocument()
+    expect(screen.getByText('2 roles')).toBeInTheDocument()
+    expect(screen.getByText('built-in')).toBeInTheDocument()
+  })
+
+  it('creates a role from the Roles tab', async () => {
+    const user = userEvent.setup()
+    let posted: Record<string, unknown> | null = null
+    server.use(
+      http.post('/service/rest/v1/security/roles', async ({ request }) => {
+        posted = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({ id: 'role-new', name: 'qa' }, { status: 201 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getByRole('button', { name: 'Roles' }))
+    await screen.findByText('developer')
+    await user.click(screen.getByRole('button', { name: /New Role/ }))
+    await user.type(screen.getByPlaceholderText('Role name (e.g. developer)'), 'qa')
+    await user.type(screen.getByPlaceholderText('Description (optional)'), 'QA team')
+    await user.click(screen.getByRole('button', { name: 'Create' }))
+    await waitFor(() => expect(posted).toBeTruthy())
+    expect((posted! as { name: string }).name).toBe('qa')
+  })
+
+  it('validates required role name', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getByRole('button', { name: 'Roles' }))
+    await screen.findByText('developer')
+    await user.click(screen.getByRole('button', { name: /New Role/ }))
+    await user.click(screen.getByRole('button', { name: 'Create' }))
+    expect(await screen.findByText('Name is required')).toBeInTheDocument()
+  })
+
+  it('deletes a non-built-in role after confirm', async () => {
+    const user = userEvent.setup()
+    let deleted = false
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    server.use(
+      http.delete('/service/rest/v1/security/roles/:id', () => {
+        deleted = true
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getByRole('button', { name: 'Roles' }))
+    const devRow = (await screen.findByText('developer')).closest('div[style]')!.parentElement!.parentElement as HTMLElement
+    const delBtn = within(devRow).getByRole('button')
+    fireEvent.click(delBtn)
+    await waitFor(() => expect(deleted).toBe(true))
+  })
+
+  it('shows an error when roles query fails', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.get('/service/rest/v1/security/roles', () =>
+        HttpResponse.json({ error: 'roles failed' }, { status: 500 }),
+      ),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getByRole('button', { name: 'Roles' }))
+    expect(await screen.findByText('roles failed')).toBeInTheDocument()
+  })
+
+  it('shows empty state on the Roles tab', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.get('/service/rest/v1/security/roles', () => HttpResponse.json([])),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getByRole('button', { name: 'Roles' }))
+    expect(await screen.findByText('No roles defined')).toBeInTheDocument()
+  })
+
+  it("resets a user's password from the row action, sending JSON the backend binds", async () => {
+    const user = userEvent.setup()
+    let putUrl = ''
+    let body: Record<string, unknown> | null = null
+    let contentType = ''
+    server.use(
+      http.put('/service/rest/v1/security/users/:userId/change-password', async ({ request, params }) => {
+        putUrl = String(params.userId)
+        contentType = request.headers.get('content-type') ?? ''
+        body = (await request.json()) as Record<string, unknown>
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getAllByTitle('Reset password')[0])
+
+    const heading = await screen.findByRole('heading', { name: /Reset Password — alice/ })
+    const form = heading.parentElement!.querySelector('form')!
+    await user.type(within(form).getByLabelText('New password *'), 'n3wp4ss-long')
+    await user.type(within(form).getByLabelText('Confirm new password *'), 'n3wp4ss-long')
+    await user.click(form.querySelector('button[type="submit"]') as HTMLButtonElement)
+
+    await waitFor(() => expect(body).toBeTruthy())
+    expect(putUrl).toBe('alice')
+    // The old shape was a raw string with Content-Type: text/plain, which the
+    // handler's ShouldBindJSON answered with a 400.
+    expect(contentType).toContain('application/json')
+    expect(body).toEqual({ newPassword: 'n3wp4ss-long' })
+    await waitFor(() => expect(screen.queryByRole('heading', { name: /Reset Password/ })).not.toBeInTheDocument())
+  })
+
+  it('refuses a mismatched confirmation without calling the API', async () => {
+    const user = userEvent.setup()
+    let called = false
+    server.use(
+      http.put('/service/rest/v1/security/users/:userId/change-password', () => {
+        called = true
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getAllByTitle('Reset password')[0])
+    const form = (await screen.findByRole('heading', { name: /Reset Password/ })).parentElement!.querySelector('form')!
+    await user.type(within(form).getByLabelText('New password *'), 'one')
+    await user.type(within(form).getByLabelText('Confirm new password *'), 'two')
+    await user.click(form.querySelector('button[type="submit"]') as HTMLButtonElement)
+    expect(await screen.findByRole('alert')).toHaveTextContent('The two passwords do not match')
+    expect(called).toBe(false)
+  })
+
+  it('surfaces a failed reset instead of closing the modal', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.put('/service/rest/v1/security/users/:userId/change-password', () =>
+        HttpResponse.json({ error: 'database unavailable' }, { status: 500 }),
+      ),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getAllByTitle('Reset password')[0])
+    const form = (await screen.findByRole('heading', { name: /Reset Password/ })).parentElement!.querySelector('form')!
+    await user.type(within(form).getByLabelText('New password *'), 'long-enough-pw')
+    await user.type(within(form).getByLabelText('Confirm new password *'), 'long-enough-pw')
+    await user.click(form.querySelector('button[type="submit"]') as HTMLButtonElement)
+    expect(await screen.findByRole('alert')).toHaveTextContent('database unavailable')
+    expect(screen.getByRole('heading', { name: /Reset Password/ })).toBeInTheDocument()
+  })
+
+  it('refuses a password below the configured minimum without calling the API', async () => {
+    // The form mirrors auth.password_min_length from /api/v1/auth/config (8 in
+    // the fixture) so the rule is stated up front instead of arriving as a 400.
+    const user = userEvent.setup()
+    const putHandler = vi.fn()
+    server.use(http.put('/service/rest/v1/security/users/:userId/change-password', putHandler))
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getAllByTitle('Reset password')[0])
+    const form = (await screen.findByRole('heading', { name: /Reset Password/ })).parentElement!.querySelector('form')!
+    expect(within(form).getByText('At least 8 characters')).toBeInTheDocument()
+    await user.type(within(form).getByLabelText('New password *'), 'short')
+    await user.type(within(form).getByLabelText('Confirm new password *'), 'short')
+    await user.click(form.querySelector('button[type="submit"]') as HTMLButtonElement)
+    expect(await screen.findByRole('alert')).toHaveTextContent('at least 8 characters')
+    expect(putHandler).not.toHaveBeenCalled()
+  })
+
+  it.each(['ldap', 'oidc', 'saml'])('disables the reset action for a %s-sourced user', async (source) => {
+    server.use(
+      http.get('/service/rest/v1/security/users', () =>
+        HttpResponse.json([userItem({ userId: 'sso-user', source })]),
+      ),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('sso-user')
+    // The backend now refuses a local password write for any non-local source
+    // (the identity provider owns the credential), so offering the action
+    // would only produce a 403.
+    const btn = screen.getByTitle(`A ${source} account's password is managed by the identity provider`)
+    expect(btn).toBeDisabled()
+  })
+
+  it('keeps the reset action enabled for a local user', async () => {
+    server.use(
+      http.get('/service/rest/v1/security/users', () =>
+        HttpResponse.json([userItem({ userId: 'alice', source: 'local' })]),
+      ),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    expect(screen.getByTitle('Reset password')).toBeEnabled()
+  })
+
+  it('edits a local user and sends the fields the API binds', async () => {
+    const user = userEvent.setup()
+    let putUser = ''
+    let body: Record<string, unknown> | null = null
+    server.use(
+      http.put('/service/rest/v1/security/users/:userId', async ({ request, params }) => {
+        putUser = String(params.userId)
+        body = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json(userItem())
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getAllByTitle('Edit user')[0])
+
+    const heading = await screen.findByRole('heading', { name: /Edit User — alice/ })
+    const form = heading.parentElement!.querySelector('form')!
+    // Pre-filled from the row, so an edit of one field keeps the rest.
+    expect(within(form).getByLabelText('Email')).toHaveValue('alice@test.com')
+    await user.clear(within(form).getByLabelText('Email'))
+    await user.type(within(form).getByLabelText('Email'), 'alice@fixed.com')
+    await user.click(form.querySelector('button[type="submit"]') as HTMLButtonElement)
+
+    await waitFor(() => expect(body).toBeTruthy())
+    expect(putUser).toBe('alice')
+    // emailAddress, not email: that is the tag domain.User binds.
+    expect(body).toEqual({
+      firstName: 'Alice',
+      lastName: 'Smith',
+      emailAddress: 'alice@fixed.com',
+      status: 'active',
+    })
+  })
+
+  it('surfaces a failed edit instead of closing the modal', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.put('/service/rest/v1/security/users/:userId', () =>
+        HttpResponse.json({ error: 'user with this email' }, { status: 409 }),
+      ),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getAllByTitle('Edit user')[0])
+    const form = (await screen.findByRole('heading', { name: /Edit User/ })).parentElement!.querySelector('form')!
+    await user.click(form.querySelector('button[type="submit"]') as HTMLButtonElement)
+    expect(await screen.findByRole('alert')).toHaveTextContent('user with this email')
+    expect(screen.getByRole('heading', { name: /Edit User/ })).toBeInTheDocument()
+  })
+
+  it('disables the edit action for a user provisioned by an identity provider', async () => {
+    server.use(
+      http.get('/service/rest/v1/security/users', () =>
+        HttpResponse.json([userItem({ userId: 'sso', source: 'oidc' })]),
+      ),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('sso')
+    // The IdP overwrites the profile on every login, so an edit here is a dead end.
+    expect(screen.getByTitle(/re-provisioned from the identity provider/)).toBeDisabled()
+  })
+
+  it('sends the email address the create modal collected', async () => {
+    const user = userEvent.setup()
+    let posted: Record<string, unknown> | null = null
+    server.use(
+      http.post('/service/rest/v1/security/users', async ({ request }) => {
+        posted = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json(userItem(), { status: 201 })
+      }),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    await user.click(screen.getByRole('button', { name: /Add User/ }))
+    const heading = await screen.findByRole('heading', { name: 'Add User' })
+    const form = heading.parentElement!.querySelector('form')!
+    await user.type(within(form).getByText('Username *').parentElement!.querySelector('input') as HTMLInputElement, 'charlie')
+    await user.type(form.querySelector('input[type="password"]') as HTMLInputElement, 's3cret-pw')
+    await user.type(form.querySelector('input[type="email"]') as HTMLInputElement, 'charlie@test.com')
+    await user.click(form.querySelector('button[type="submit"]') as HTMLButtonElement)
+
+    await waitFor(() => expect(posted).toBeTruthy())
+    // The key used to be "email", which the handler's domain.User bind ignored,
+    // so every user created from the UI lost their address (#446).
+    expect(posted).toMatchObject({ userId: 'charlie', emailAddress: 'charlie@test.com' })
+  })
+})

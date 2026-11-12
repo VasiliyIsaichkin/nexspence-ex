@@ -1,0 +1,23 @@
+{{- /* A StatefulSet claims per pod through volumeClaimTemplates instead. */ -}}
+{{- if and (eq .Values.storage.type "local") (not .Values.storage.local.existingClaim) (eq (include "nexspence.workloadKind" .) "Deployment") }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "nexspence.fullname" . }}-blobs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nexspence.labels" . | nindent 4 }}
+  annotations:
+    # The blobs outlive the release: switching to a StatefulSet or to an
+    # existingClaim drops this PVC from the manifest, and helm would delete it.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - {{ .Values.storage.local.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.local.size }}
+  {{- with .Values.storage.local.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+{{- end }}

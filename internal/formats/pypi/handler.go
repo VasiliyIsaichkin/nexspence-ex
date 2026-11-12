@@ -1,0 +1,367 @@
+// Package pypi implements the PyPI (Python Package Index) repository protocol.
+//
+// GET  /simple/                  → HTML index of all packages
+// GET  /simple/:package/         → HTML links for a package's files
+// POST /                         → twine upload (multipart/form-data)
+// GET  /packages/:package/:file  → download wheel/sdist
+package pypi
+
+import (
+	"context"
+	"fmt"
+	"html"
+	"log"
+	"net/http"
+	"path"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/formats"
+	"github.com/nexspence-oss/nexspence/internal/formats/base"
+	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
+)
+
+// requiresPythonKey holds a release's Requires-Python specifier in its
+// component's extra, as recorded from the upload form (#665). PyPI keeps it per
+// release, and so does this: every file of a version shares one component.
+const requiresPythonKey = "requires_python"
+
+// maxRequiresPythonLen bounds the recorded specifier; real ones are a few
+// dozen bytes.
+const maxRequiresPythonLen = 1024
+
+// Handler serves the PyPI repository protocol.
+type Handler struct {
+	deps formats.Deps
+
+	// ageMu/ageDates cache per-package upload-time maps for the
+	// minimum-package-age policy (#323); see age_filter.go.
+	ageMu    sync.Mutex
+	ageDates map[string]uploadTimesEntry
+}
+
+// New creates a PyPI format Handler with the given dependencies.
+func New(deps formats.Deps) *Handler { return &Handler{deps: deps} }
+
+// Name returns the format identifier.
+func (h *Handler) Name() string { return "pypi" }
+
+func (h *Handler) ServeHTTP(c *gin.Context) {
+	p := normPath(c.Param("path"))
+	repoName := c.Param("repoName")
+	ctx := c.Request.Context()
+	repo, err := h.deps.Repos.Get(ctx, repoName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	switch {
+	// Upload: POST /
+	case c.Request.Method == http.MethodPost && (p == "/" || p == ""):
+		if repoproxy.RejectMutation(c, repo) {
+			return
+		}
+		h.handleUpload(c, repoName)
+
+	// Package simple index: GET /simple/ (path.Clean strips trailing slash → "/simple")
+	case c.Request.Method == http.MethodGet && (p == "/simple" || p == "/simple/"):
+		if repo != nil && repo.Type == domain.TypeProxy {
+			forceHTMLSimplePage(c)
+			coords := base.Coords{Name: "_simple", Version: "index"}
+			// The simple index is mutable metadata — revalidate on a TTL.
+			if err := repoproxy.ServeGET(c, h.deps, repo, p, "", coords, "text/html; charset=utf-8", repoproxy.MetadataMaxAge(repo)); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			}
+			return
+		}
+		h.serveSimpleIndex(c, repoName)
+
+	// Per-package index: GET /simple/:name/
+	case c.Request.Method == http.MethodGet && strings.HasPrefix(p, "/simple/"):
+		pkgName := strings.TrimSuffix(strings.TrimPrefix(p, "/simple/"), "/")
+		if repo != nil && repo.Type == domain.TypeProxy {
+			forceHTMLSimplePage(c)
+			normalized := normalizePackageName(pkgName)
+			coords := base.Coords{Name: normalized, Version: "simple-page"}
+			// A per-package simple page is mutable metadata (new releases appear).
+			// File hrefs are rewritten on serve so pip pulls wheels/sdists through
+			// this proxy instead of upstream (#98); the cache keeps the original.
+			localBase := strings.TrimRight(h.deps.BaseURL, "/") + "/repository/" + repo.Name
+			rewrite := func(b []byte) []byte { return RewriteSimplePage(b, localBase) }
+			if minAge := repoproxy.MinimumPackageAge(repo); minAge > 0 {
+				if dates := h.simpleUploadTimes(c.Request.Context(), repo, normalized); len(dates) > 0 {
+					cutoff := time.Now().Add(-minAge)
+					inner := rewrite
+					rewrite = func(b []byte) []byte { return inner(FilterSimpleHTMLByAge(b, dates, cutoff)) }
+				} else {
+					log.Printf("nexspence: minimum_package_age not applied for %s/%s — upstream provides no upload dates", repo.Name, normalized)
+				}
+			}
+			if err := repoproxy.ServeGETRewritten(c, h.deps, repo, p, "", coords, "text/html; charset=utf-8", repoproxy.MetadataMaxAge(repo), rewrite); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			}
+			return
+		}
+		h.servePackageIndex(c, repoName, pkgName)
+
+	// Download: GET /packages/... or any other path
+	case c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead:
+		h.serveFile(c, repoName, p)
+
+	default:
+		c.Status(http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleUpload(c *gin.Context, repoName string) {
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	action := c.Request.FormValue(":action")
+	if action != "file_upload" && action != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported action: " + action})
+		return
+	}
+
+	f, fh, err := c.Request.FormFile("content")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing content file"})
+		return
+	}
+	defer func() { _ = f.Close() }()
+
+	pkgName := normalizePackageName(c.Request.FormValue("name"))
+	version := c.Request.FormValue("version")
+	if pkgName == "" || version == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name and version are required"})
+		return
+	}
+
+	requiresPython, err := uploadRequiresPython(c.Request.FormValue("requires_python"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	filename := fh.Filename
+	filePath := "/packages/" + pkgName + "/" + filename
+	ct := fh.Header.Get("Content-Type")
+	if ct == "" {
+		ct = pypiContentType(filename)
+	}
+
+	coords := base.Coords{Name: pkgName, Version: version}
+	// Storing a file upserts the release's component, which resets its extra,
+	// so the specifier is written back after every upload: the one this upload
+	// sent, else the one the release already had — a file uploaded without it
+	// (an older client, curl) must not strip it from its siblings. When files
+	// of one release disagree, the last one sent wins.
+	if requiresPython == "" {
+		if requiresPython, err = h.releaseRequiresPython(c.Request.Context(), repoName, pkgName, version); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	res, err := base.StoreArtifact(c.Request.Context(), h.deps,
+		repoName, filePath, ct, coords, f, fh.Size)
+	if err != nil {
+		c.JSON(base.HTTPStatusForError(err), gin.H{"error": err.Error()})
+		return
+	}
+	if requiresPython != "" {
+		if err := h.deps.Components.UpdateExtra(c.Request.Context(), res.Asset.ComponentID,
+			map[string]any{requiresPythonKey: requiresPython}); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	c.Status(http.StatusOK)
+}
+
+// releaseRequiresPython returns the specifier recorded for a release, or "".
+func (h *Handler) releaseRequiresPython(ctx context.Context, repoName, pkgName, version string) (string, error) {
+	comps, err := base.ExactComponents(ctx, h.deps.Components, domain.SearchParams{
+		Repository: repoName, Name: pkgName, Version: version,
+	})
+	if err != nil {
+		return "", err
+	}
+	for _, comp := range comps {
+		if comp.Version != version {
+			continue
+		}
+		if rp, _ := comp.Extra[requiresPythonKey].(string); rp != "" {
+			return rp, nil
+		}
+	}
+	return "", nil
+}
+
+// uploadRequiresPython validates the upload form's requires_python field. The
+// value is rendered (escaped) into the simple page, so only its size and the
+// absence of control characters are enforced; pip itself ignores a specifier
+// it cannot parse.
+func uploadRequiresPython(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if len(v) > maxRequiresPythonLen {
+		return "", fmt.Errorf("requires_python is longer than %d bytes", maxRequiresPythonLen)
+	}
+	for _, r := range v {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("requires_python contains a control character")
+		}
+	}
+	return v, nil
+}
+
+func (h *Handler) serveSimpleIndex(c *gin.Context, repoName string) {
+	comps, err := base.AllComponents(c.Request.Context(), h.deps.Components, repoName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Deduplicate package names
+	seen := map[string]struct{}{}
+	var names []string
+	for _, comp := range comps {
+		n := normalizePackageName(comp.Name)
+		if _, ok := seen[n]; !ok {
+			seen[n] = struct{}{}
+			names = append(names, n)
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("<!DOCTYPE html><html><head><title>Simple Index</title></head><body><h1>Simple Index</h1>\n")
+	for _, n := range names {
+		fmt.Fprintf(&sb, `<a href="/repository/%s/simple/%s/">%s</a><br/>`,
+			html.EscapeString(repoName), html.EscapeString(n), html.EscapeString(n))
+	}
+	sb.WriteString("</body></html>")
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(sb.String()))
+}
+
+func (h *Handler) servePackageIndex(c *gin.Context, repoName, pkgName string) {
+	normalized := normalizePackageName(pkgName)
+	// Names are stored normalized (upload and migration both normalize), so
+	// the lookup is exact. Search matches substrings, which would list
+	// acme-requests's files on requests's page and stop at one page (#586).
+	comps, err := base.ExactComponents(c.Request.Context(), h.deps.Components, domain.SearchParams{
+		Repository: repoName, Name: normalized,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "<!DOCTYPE html><html><head><title>Links for %s</title></head><body><h1>Links for %s</h1>\n",
+		html.EscapeString(pkgName), html.EscapeString(pkgName))
+
+	for _, comp := range comps {
+		assets, err := h.deps.Assets.ListByComponentID(c.Request.Context(), comp.ID)
+		if err != nil {
+			continue
+		}
+		// PEP 503: the attribute carries the specifier HTML-escaped, and is
+		// left out when the release recorded none.
+		requires := ""
+		if rp, _ := comp.Extra[requiresPythonKey].(string); rp != "" {
+			requires = ` data-requires-python="` + html.EscapeString(rp) + `"`
+		}
+		for _, a := range assets {
+			filename := path.Base(a.Path)
+			href := h.deps.BaseURL + "/repository/" + repoName + a.Path
+			sha := ""
+			if a.SHA256 != "" {
+				sha = "#sha256=" + a.SHA256
+			}
+			fmt.Fprintf(&sb, `<a href="%s%s"%s>%s</a><br/>`,
+				html.EscapeString(href), sha, requires, html.EscapeString(filename))
+		}
+	}
+	sb.WriteString("</body></html>")
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(sb.String()))
+}
+
+func (h *Handler) serveFile(c *gin.Context, repoName, filePath string) {
+	repo, err := h.deps.Repos.Get(c.Request.Context(), repoName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if repo != nil && repo.Type == domain.TypeProxy {
+		if minAge := repoproxy.MinimumPackageAge(repo); minAge > 0 {
+			if !h.fileAgeAllowed(c, repo, filePath, minAge) {
+				return
+			}
+		}
+		pkgGuess := path.Base(path.Dir(filePath))
+		coords := base.Coords{Name: normalizePackageName(pkgGuess), Version: "wheel"}
+		ct := pypiContentType(path.Base(filePath))
+		// Wheels/sdists are immutable release files — never revalidate.
+		if err := repoproxy.ServeGET(c, h.deps, repo, filePath, "", coords, ct, 0); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	rc, asset, err := base.FetchArtifact(c.Request.Context(), h.deps, repoName, filePath)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	defer func() { _ = rc.Close() }()
+	if asset.SHA256 != "" {
+		c.Header("X-Checksum-SHA256", asset.SHA256)
+	}
+	if c.Request.Method == http.MethodHead {
+		c.Header("Content-Length", fmt.Sprintf("%d", asset.SizeBytes))
+		c.Status(http.StatusOK)
+		return
+	}
+	c.DataFromReader(http.StatusOK, asset.SizeBytes, asset.ContentType, rc, nil)
+}
+
+// forceHTMLSimplePage pins the upstream Accept for proxied simple pages to
+// PEP 503 HTML (#191). Modern pip asks for the PEP 691 JSON page; forwarding
+// that upstream breaks everything downstream that assumes HTML — href
+// rewriting (#98), anchor-based group merging (#99), and the one-representation
+// -per-path cache. pip accepts an HTML answer via content negotiation, so
+// always fetching HTML keeps the cache correct by construction. The request
+// here is the handler's own (groups fan out on a clone), so the mutation never
+// leaks back to the client's request.
+func forceHTMLSimplePage(c *gin.Context) {
+	c.Request.Header.Set("Accept", "text/html")
+}
+
+func normalizePackageName(name string) string {
+	// PEP 503: normalize to lowercase, replace [-_.] with -
+	name = strings.ToLower(name)
+	name = strings.NewReplacer("_", "-", ".", "-").Replace(name)
+	return name
+}
+
+func pypiContentType(filename string) string {
+	switch {
+	case strings.HasSuffix(filename, ".whl"):
+		return "application/zip"
+	case strings.HasSuffix(filename, ".tar.gz"), strings.HasSuffix(filename, ".tgz"):
+		return "application/gzip"
+	case strings.HasSuffix(filename, ".zip"):
+		return "application/zip"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+func normPath(p string) string {
+	return path.Clean("/" + strings.TrimPrefix(p, "/"))
+}

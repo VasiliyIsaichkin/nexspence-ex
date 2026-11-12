@@ -1,0 +1,118 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nexspence.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nexspence.labels" . | nindent 4 }}
+data:
+  # config.httpAddr used to go out as NEXSPENCE_HTTP_LISTEN, which matches no
+  # config key (the real one is http.addr), so the value was inert and the
+  # server stayed on its own :8081 default — the same default the chart ships,
+  # which is why nobody noticed. scripts/check-helm-env.py guards the class.
+  NEXSPENCE_HTTP_ADDR: {{ .Values.config.httpAddr | quote }}
+  NEXSPENCE_HTTP_BASE_URL: {{ .Values.config.baseURL | quote }}
+  {{- if .Values.config.trustedProxies }}
+  # Comma-separated; viper's default mapstructure decode hook splits a
+  # []string env override on "," (config_test.go:TestLoad_TrustedProxies_EnvOverride).
+  NEXSPENCE_HTTP_TRUSTED_PROXIES: {{ .Values.config.trustedProxies | join "," | quote }}
+  {{- end }}
+  {{- with .Values.config.outbound }}
+  {{- if .allowedInternalCidrs }}
+  NEXSPENCE_OUTBOUND_ALLOWED_INTERNAL_CIDRS: {{ .allowedInternalCidrs | join "," | quote }}
+  {{- end }}
+  {{- end }}
+  NEXSPENCE_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  NEXSPENCE_LOG_FORMAT: {{ .Values.config.logFormat | quote }}
+  NEXSPENCE_AUTH_JWT_EXPIRY_HOURS: {{ .Values.config.jwtExpiryHours | quote }}
+  NEXSPENCE_AUTH_ALLOW_INSECURE_DEFAULTS: {{ .Values.config.allowInsecureDefaults | quote }}
+  NEXSPENCE_BOOTSTRAP_ENABLED: {{ .Values.config.bootstrapEnabled | quote }}
+  {{- if .Values.config.bootstrapEnabled }}
+  {{- if not .Values.config.adminExistingSecret }}
+  NEXSPENCE_BOOTSTRAP_ADMIN_USERNAME: {{ .Values.config.adminUsername | quote }}
+  {{- end }}
+  NEXSPENCE_BOOTSTRAP_ADMIN_EMAIL: {{ .Values.config.adminEmail | quote }}
+  NEXSPENCE_BOOTSTRAP_ADMIN_FIRST_NAME: {{ .Values.config.adminFirstName | quote }}
+  {{- end }}
+  NEXSPENCE_METRICS_PUBLIC: {{ .Values.config.metricsPublic | quote }}
+  # The limiter counts authenticated calls per user and anonymous calls per
+  # client address. The names are spelled from the config keys
+  # auth.rate_limit_enabled / _rps / _burst, which viper derives the env name
+  # from — a different spelling is ignored silently.
+  NEXSPENCE_AUTH_RATE_LIMIT_ENABLED: {{ .Values.config.rateLimitEnabled | quote }}
+  NEXSPENCE_AUTH_RATE_LIMIT_RPS: {{ .Values.config.rateLimitRps | quote }}
+  NEXSPENCE_AUTH_RATE_LIMIT_BURST: {{ .Values.config.rateLimitBurst | quote }}
+  NEXSPENCE_DOCKER_SUBDOMAIN_CONNECTOR_ENABLED: {{ .Values.config.docker.subdomainConnector.enabled | quote }}
+  NEXSPENCE_DOCKER_SUBDOMAIN_CONNECTOR_BASE_DOMAIN: {{ .Values.config.docker.subdomainConnector.baseDomain | quote }}
+  {{- with .Values.config.helm.indexCacheTTL }}
+  NEXSPENCE_HELM_INDEX_CACHE_TTL: {{ . | quote }}
+  {{- end }}
+  NEXSPENCE_PROMOTION_AUTO_SETTLE_WINDOW: {{ .Values.config.promotion.autoSettleWindow | quote }}
+  NEXSPENCE_PROMOTION_AUTO_SCAN_WAIT: {{ .Values.config.promotion.autoScanWait | quote }}
+  NEXSPENCE_PROMOTION_AUTO_POLL_INTERVAL: {{ .Values.config.promotion.autoPollInterval | quote }}
+  NEXSPENCE_TRACING_ENABLED: {{ .Values.tracing.enabled | quote }}
+  {{- if .Values.tracing.enabled }}
+  NEXSPENCE_TRACING_OTLP_ENDPOINT: {{ .Values.tracing.otlpEndpoint | quote }}
+  NEXSPENCE_TRACING_OTLP_PROTOCOL: {{ .Values.tracing.otlpProtocol | quote }}
+  NEXSPENCE_TRACING_OTLP_INSECURE: {{ .Values.tracing.otlpInsecure | quote }}
+  NEXSPENCE_TRACING_SAMPLE_RATIO: {{ .Values.tracing.sampleRatio | quote }}
+  NEXSPENCE_TRACING_SERVICE_NAME: {{ .Values.tracing.serviceName | quote }}
+  NEXSPENCE_TRACING_ENVIRONMENT: {{ .Values.tracing.environment | quote }}
+  {{- end }}
+  NEXSPENCE_OIDC_ENABLED: {{ .Values.oidc.enabled | quote }}
+  {{- if or .Values.redis.enabled .Values.externalRedis.enabled }}
+  NEXSPENCE_REDIS_ENABLED: "true"
+  NEXSPENCE_REDIS_ADDR: {{ include "nexspence.redisAddr" . | quote }}
+  NEXSPENCE_REDIS_DB: {{ include "nexspence.redisDB" . | quote }}
+  {{- else }}
+  NEXSPENCE_REDIS_ENABLED: "false"
+  {{- end }}
+  # storage.default_type is the one setting that actually tells the app which
+  # backend to use — emitting only the type-specific block below and never
+  # this key meant storage.type: s3 in values had zero effect on the running
+  # app, which stayed on "local" (its own default) regardless.
+  {{- $storageType := .Values.storage.type }}
+  {{- if not (or (eq $storageType "local") (eq $storageType "s3") (eq $storageType "azure")) }}
+  {{- fail (printf "storage.type must be local, s3 or azure, got %q" $storageType) }}
+  {{- end }}
+  NEXSPENCE_STORAGE_DEFAULT_TYPE: {{ $storageType | quote }}
+  {{- if eq $storageType "local" }}
+  NEXSPENCE_STORAGE_LOCAL_BASE_PATH: {{ .Values.storage.local.mountPath | quote }}
+  {{- else if eq $storageType "s3" }}
+  NEXSPENCE_STORAGE_S3_ENDPOINT: {{ .Values.storage.s3.endpoint | quote }}
+  NEXSPENCE_STORAGE_S3_BUCKET: {{ .Values.storage.s3.bucket | quote }}
+  NEXSPENCE_STORAGE_S3_REGION: {{ .Values.storage.s3.region | quote }}
+  # Viper derives the env name from the config key, so these have to be spelled
+  # storage.s3.force_path_style / skip_tls_verify exactly. The chart used to set
+  # NEXSPENCE_STORAGE_S3_USE_SSL, which matches no key at all and was silently
+  # dropped, leaving MinIO installs without path-style addressing.
+  NEXSPENCE_STORAGE_S3_FORCE_PATH_STYLE: {{ .Values.storage.s3.forcePathStyle | quote }}
+  NEXSPENCE_STORAGE_S3_SKIP_TLS_VERIFY: {{ .Values.storage.s3.skipTLSVerify | quote }}
+  {{- else if eq $storageType "azure" }}
+  NEXSPENCE_STORAGE_AZURE_CONTAINER: {{ .Values.storage.azure.container | quote }}
+  NEXSPENCE_STORAGE_AZURE_ACCOUNT_NAME: {{ .Values.storage.azure.accountName | quote }}
+  NEXSPENCE_STORAGE_AZURE_ENDPOINT: {{ .Values.storage.azure.endpoint | quote }}
+  NEXSPENCE_STORAGE_AZURE_SKIP_TLS_VERIFY: {{ .Values.storage.azure.skipTLSVerify | quote }}
+  {{- end }}
+{{- if .Values.config.docker.subdomainConnector.aliases }}
+---
+# A YAML map cannot be an environment variable, so subdomain-connector aliases
+# ride in as a config file mounted over the image's /app/config.yaml. Every
+# other setting still comes from the env above, which viper reads last and so
+# takes precedence over anything in here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nexspence.fullname" . }}-file
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nexspence.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    docker:
+      subdomain_connector:
+        aliases:
+          {{- range $host, $repo := .Values.config.docker.subdomainConnector.aliases }}
+          {{ $host | quote }}: {{ $repo | quote }}
+          {{- end }}
+{{- end }}

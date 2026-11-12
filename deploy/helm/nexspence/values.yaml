@@ -1,0 +1,472 @@
+# -- Override chart name
+nameOverride: ""
+# -- Override fully qualified app name
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/nexspence/nexspence
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (defaults to chart appVersion)
+  tag: ""
+
+imagePullSecrets: []
+
+replicaCount: 1
+
+# -- Workload controller: "Deployment" (default) or "StatefulSet".
+# A StatefulSet gives the pod a stable identity and, on chart-managed local
+# storage, its own blob volume through volumeClaimTemplates — kept across
+# reschedules, and never mounted by two pods at once during a rollout, which a
+# Deployment on a ReadWriteOnce volume can deadlock on. Per-pod volumes cannot
+# be shared, so that layout is limited to one replica; for more, use a shared
+# storage.local.existingClaim (ReadWriteMany) or s3/azure storage.
+# Switching an existing install keeps its blobs in two steps: first upgrade to
+# this chart version as a Deployment (that marks the chart's PVC to be kept),
+# then switch with storage.local.existingClaim="<release>-nexspence-blobs".
+workloadKind: Deployment
+
+serviceAccount:
+  # -- Create a ServiceAccount
+  create: true
+  # -- Annotations to add to the service account
+  annotations: {}
+  # -- Override the name
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 1000
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# -- Nexspence application configuration
+config:
+  # -- External URL (used in download links, Docker subdomain connector)
+  baseURL: "http://nexspence.example.com"
+  logLevel: "info"
+  logFormat: "json"
+  httpAddr: ":8081"
+  # -- Peers (IPs or CIDRs) allowed to set X-Forwarded-For. Every chart
+  # deployment sits behind an ingress/gateway, so leaving this empty (the
+  # app's own default) means the audit log and any IP-based logic only ever
+  # see the ingress's own pod IP, never the real client. Set to the in-cluster
+  # pod CIDR, or "*" to trust every hop (only safe when the server is
+  # unreachable except through a proxy you control).
+  trustedProxies: []
+  # -- Internal CIDRs the SSRF guard may reach (proxy remotes, webhooks,
+  # replication, Nexus migration). Empty refuses every private/loopback
+  # address. Emitted as NEXSPENCE_OUTBOUND_ALLOWED_INTERNAL_CIDRS (comma-separated).
+  outbound:
+    allowedInternalCidrs: []
+  # -- JWT secret (min 32 chars). Leave empty to auto-generate a unique random
+  # secret on first install and persist it across upgrades (recommended). Set an
+  # explicit value only if you need to share the secret across clusters.
+  jwtSecret: ""
+  # -- Existing Secret instead of jwtSecret / auto-generate.
+  jwtSecretExistingSecret: ""
+  jwtSecretExistingSecretKey: "jwt-secret"
+  # -- Permit the shipped default admin password ("admin123") at startup.
+  # Defaults to true so the chart's quick-start boots out of the box; set to false
+  # in production once you have set a unique adminPassword. The JWT secret is no
+  # longer a shipped default (it is auto-generated when jwtSecret is empty).
+  allowInsecureDefaults: true
+  jwtExpiryHours: 8
+  # -- Create/repair the bootstrap admin on every start. Set to false once real
+  # accounts exist, so the admin credentials below can be dropped from values
+  # and the Secret; an existing admin is then never touched.
+  bootstrapEnabled: true
+  # -- Bootstrap admin credentials (ignored when bootstrapEnabled is false)
+  adminUsername: "admin"
+  adminPassword: "admin123"
+  # -- Existing Secret for bootstrap username and password.
+  adminExistingSecret: ""
+  adminExistingSecretUsernameKey: "admin-username"
+  adminExistingSecretPasswordKey: "admin-password"
+  adminEmail: "admin@example.com"
+  adminFirstName: "Admin"
+  # -- Serve GET /metrics without authentication. It shares the listener with
+  # the API, so the default requires a Bearer token; set this to true when only
+  # the cluster network reaches the Service and a scrape token would just be one
+  # more secret to rotate.
+  metricsPublic: false
+  # -- Request rate limit. The limiter counts authenticated calls per user, so
+  # several users behind one address (a corporate NAT, a CI runner) do not
+  # share a bucket; anonymous calls are counted per client address. These
+  # mirror the server defaults — raise them when a package manager or a CI
+  # pipeline legitimately bursts, lower them to tighten an instance.
+  rateLimitEnabled: true
+  rateLimitRps: 50
+  rateLimitBurst: 100
+  # -- Docker subdomain connector: serve each Docker repository on its own
+  # hostname, so clients can `docker pull myrepo.example.com/alpine` instead of
+  # `docker pull nexspence.example.com:8081/repository/myrepo/alpine`. Needs a
+  # wildcard DNS record for baseDomain and an ingress that passes the original
+  # Host header through — see docs/docker-subdomain-connector.md.
+  docker:
+    subdomainConnector:
+      enabled: false
+      # -- The domain the "<repo>.<baseDomain>" hostnames sit under. Optional
+      # when only aliases are used.
+      baseDomain: ""
+      # -- Hostname → repository name, for DNS names that do not match the
+      # repository (a Nexus connector port being migrated, say). Any domain
+      # works; the hostname does not have to sit under baseDomain. Setting any
+      # alias mounts a small config file into the container, because a YAML map
+      # cannot be expressed as an environment variable.
+      #   aliases:
+      #     docker-hub-proxy.example.com: dockerhub-proxy
+      aliases: {}
+  helm:
+    # -- How long a Helm proxy reuses an upstream index.yaml when resolving where
+    # an uncached chart tarball comes from. Empty keeps the server default (5m);
+    # "0s" fetches the index per lookup, at the cost of one download per chart
+    # pull per proxy member. The index served to clients is never cached.
+    indexCacheTTL: ""
+  # -- Automatic promotion on publish, for promotion rules with
+  # "Promote automatically on publish" on. Durations are Go durations.
+  promotion:
+    # -- How long a published component must go without a new file before it
+    # is promoted, so a multi-file upload (jar + pom + sources) moves once.
+    autoSettleWindow: "30s"
+    # -- How long a rule that requires a scan waits for one before the
+    # promotion is recorded as blocked.
+    autoScanWait: "1h"
+    # -- How often each replica looks for components due for promotion.
+    autoPollInterval: "5s"
+
+# -- OIDC single sign-on. Every field below is sensitive (issuer/redirect_url/
+# admin_group name real internal infrastructure and access-control policy) and
+# renders into secret.yaml, not configmap.yaml — only `enabled` is a plain
+# value, since it has to gate templating itself.
+oidc:
+  enabled: false
+  issuer: ""
+  publicIssuerUrl: ""
+  clientId: ""
+  # -- Prefer clientSecretExistingSecret below — a plaintext value here tends
+  # to end up committed to a values file. Uncomment only if you genuinely have
+  # no existing Secret to point at.
+  # clientSecret: ""
+  # -- Reference an existing Secret instead of putting the client secret in
+  # values.
+  clientSecretExistingSecret: ""
+  clientSecretExistingSecretKey: "client-secret"
+  redirectUrl: ""
+  frontendBaseUrl: ""
+  scopes: ["openid", "profile", "email", "groups"]
+  provisioning: "auto"
+  groupsClaim: "groups"
+  adminGroup: ""
+  usernameClaim: "preferred_username"
+  emailClaim: "email"
+  nameClaim: "name"
+  showLoginButton: true
+  cookieSecure: true
+  allowedSkewSeconds: 60
+  # -- Google Workspace group lookups via the Admin SDK Directory API. A
+  # Google id_token never carries groups, so without this adminGroup /
+  # roleMappings cannot apply to Google logins. Needs a service account with
+  # domain-wide delegation for admin.directory.group.readonly, impersonating
+  # a Workspace user with directory read rights. Match on group EMAILS.
+  googleAdminSDK:
+    enabled: false
+    # -- Existing Secret holding the service-account JSON key.
+    serviceAccountKeyExistingSecret: ""
+    serviceAccountKeyExistingSecretKey: "key.json"
+    # -- Workspace user the service account impersonates.
+    subjectEmail: ""
+  # -- Leave empty to auto-generate and persist across upgrades (same pattern
+  # as config.jwtSecret) so an upgrade never rotates it out from under a login
+  # in flight.
+  cookieKey: ""
+  # -- Existing Secret instead of cookieKey / auto-generate.
+  cookieKeyExistingSecret: ""
+  cookieKeyExistingSecretKey: "oidc-cookie-key"
+
+# -- Redis: backs the distributed lock (cleanup/GC/replication/migration cron
+# coordination across replicas) and the login-attempt rate limiter's shared
+# state. Required once replicaCount > 1 / autoscaling.enabled, or every pod
+# runs its own uncoordinated schedule and rate limiting stops being global.
+redis:
+  enabled: false
+  auth:
+    # -- Prefer existingSecret below — a plaintext value here tends to end up
+    # committed to a values file. Uncomment only if you genuinely have no
+    # existing Secret to point at.
+    # password: ""
+    # -- Reference an existing Secret instead of putting the password in values.
+    existingSecret: ""
+    existingSecretKey: "password"
+
+# -- External Redis (used when redis.enabled=false and you still want the
+# distributed-lock/rate-limiter coordination above)
+externalRedis:
+  enabled: false
+  addr: ""
+  # -- Prefer existingSecret below — a plaintext value here tends to end up
+  # committed to a values file. Uncomment only if you genuinely have no
+  # existing Secret to point at.
+  # password: ""
+  # -- Reference an existing Secret instead of putting the password in values.
+  existingSecret: ""
+  existingSecretKey: "password"
+  db: 0
+
+# -- Blob storage: "local", "s3" or "azure"
+storage:
+  type: local
+  local:
+    mountPath: "/blobs"
+    # -- PVC size for blob storage
+    size: "100Gi"
+    storageClass: ""
+    # -- ReadWriteOnce (default) or ReadWriteMany for a shared filesystem
+    # (e.g. AWS EFS via efs-csi) across replicas — LocalBlobStore's writes
+    # (atomic rename, single-writer append) don't depend on POSIX locking, so
+    # RWX is safe.
+    accessMode: "ReadWriteOnce"
+    # -- Bring your own PVC (e.g. a statically-provisioned EFS access point):
+    # when set, the chart skips rendering its own PVC and mounts this claim.
+    existingClaim: ""
+  s3:
+    # -- Filled when storage.type=s3
+    endpoint: ""
+    bucket: ""
+    region: "us-east-1"
+    # -- Prefer existingSecret below — a plaintext value here tends to end up
+    # committed to a values file. Uncomment only if you genuinely have no
+    # existing Secret to point at.
+    # accessKey: ""
+    # secretKey: ""
+    # -- Reference an existing Secret instead of putting the credentials in values.
+    existingSecret: ""
+    existingSecretAccessKeyKey: "access-key"
+    existingSecretSecretKeyKey: "secret-key"
+    # -- Path-style addressing (bucket in the path, not the hostname). Required
+    # by MinIO and most non-AWS S3 implementations.
+    forcePathStyle: true
+    # -- Accept the endpoint's TLS certificate without verifying it. For an
+    # on-prem S3 behind a private CA; the connection carries the credentials and
+    # every blob, so prefer trusting the CA.
+    skipTLSVerify: false
+  azure:
+    # -- Filled when storage.type=azure. The container must already exist.
+    container: ""
+    accountName: ""
+    # -- Custom endpoint, e.g. Azurite. Empty uses https://<account>.blob.core.windows.net
+    endpoint: ""
+    # -- Prefer existingSecret below — a plaintext value here tends to end up
+    # committed to a values file. Uncomment only if you genuinely have no
+    # existing Secret to point at. Leave every credential empty to use the
+    # pod's Entra ID identity (workload identity / managed identity); set
+    # serviceAccount.annotations accordingly.
+    # accountKey: ""
+    # connectionString: ""
+    # sasToken: ""
+    # -- Reference an existing Secret instead of putting credentials in values.
+    existingSecret: ""
+    # -- Which credential the Secret holds: accountKey | connectionString | sasToken
+    existingSecretKind: "accountKey"
+    existingSecretKey: ""
+    # -- Accept the endpoint's TLS certificate without verifying it. For an
+    # on-prem emulator / private CA; prefer trusting the CA.
+    skipTLSVerify: false
+
+# -- OpenTelemetry distributed tracing (HTTP, DB, blob-store, background jobs,
+# cross-instance replication). Off by default — nexspence ships no trace
+# backend, point otlpEndpoint at whatever collector/Jaeger/Tempo you run.
+tracing:
+  enabled: false
+  otlpEndpoint: "otel-collector:4317"
+  # -- Exporter transport: "grpc" (default, port 4317) or "http" (port 4318)
+  otlpProtocol: "grpc"
+  # -- Send plaintext instead of TLS — for a collector on the same cluster/VPC
+  otlpInsecure: true
+  # -- Head-samples root spans at this ratio (0..1); child spans follow their parent
+  sampleRatio: 0.1
+  serviceName: "nexspence"
+  # -- Distinguishes this deployment's traces (e.g. "prod", "staging") when several share one backend
+  environment: ""
+
+service:
+  type: ClusterIP
+  port: 80
+  # The container's named port, so the Service follows config.httpAddr too.
+  targetPort: http
+  annotations: {}
+
+# ── Ingress (nginx / traefik / cilium ingress-controller) ──────────────
+# Exactly ONE of ingress or gateway should be enabled at a time.
+ingress:
+  enabled: false
+  # -- IngressClass name: "nginx" | "traefik" | "cilium"
+  className: "nginx"
+  annotations: {}
+  hosts:
+    - host: nexspence.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# ── API Gateway: Istio ─────────────────────────────────────────────────
+gateway:
+  istio:
+    enabled: false
+    # -- Labels for Gateway.spec.selector (workload), not a Gateway CR name.
+    gatewaySelector:
+      istio: ingressgateway
+    # -- Existing Gateway CR (`name` or `namespace/name`). Skips creating one.
+    existingGateway: ""
+    # -- Port exposed on the Istio Gateway
+    port: 80
+    # -- TLS mode: SIMPLE | PASSTHROUGH | MUTUAL | ""
+    tlsMode: ""
+    # -- Secret name for TLS (required when tlsMode=SIMPLE)
+    tlsSecret: ""
+    hosts:
+      - "nexspence.example.com"
+    # -- Extra annotations on the VirtualService
+    vsAnnotations: {}
+    # -- Timeout for VirtualService routes
+    timeout: "300s"
+
+  # ── API Gateway: Cilium (K8s Gateway API) ─────────────────────────────
+  cilium:
+    enabled: false
+    # -- Gateway API GatewayClass name (cilium registers "cilium")
+    gatewayClassName: "cilium"
+    hosts:
+      - host: nexspence.example.com
+        paths:
+          - path: /
+            pathType: PathPrefix
+    tls: []
+    # -- Extra annotations on the Gateway resource
+    gatewayAnnotations: {}
+
+# ── Horizontal Pod Autoscaler ─────────────────────────────────────────
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    cpu: "2000m"
+    memory: "1Gi"
+
+# ── Liveness / Readiness probes ───────────────────────────────────────
+livenessProbe:
+  httpGet:
+    path: /healthz
+    # The container's named port, so the probe follows config.httpAddr.
+    port: http
+  initialDelaySeconds: 20
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Extra volumes/mounts on the main container, e.g. a custom CA bundle
+# Secret/ConfigMap for `database.dsn`'s sslmode=verify-ca/verify-full (which
+# already works at the application level — pgxpool.ParseConfig parses standard
+# libpq syntax — the chart just has nowhere to put the certificate file).
+extraVolumes: []
+extraVolumeMounts: []
+
+# -- Extra environment variables for the container, for a setting the chart
+# does not model yet:
+#   extraEnv:
+#     - name: NEXSPENCE_LOG_LEVEL
+#       value: debug
+# A value set here wins over the same variable coming from the chart's own
+# ConfigMap, because Kubernetes reads `env` after `envFrom`.
+extraEnv: []
+
+# ── PostgreSQL sub-chart (bitnami) ────────────────────────────────────
+# Set enabled: false and provide externalDatabase.dsn for external Postgres.
+postgresql:
+  enabled: true
+  # Bitnami removed the legacy `docker.io/bitnami/*` image tags from Docker Hub
+  # in 2025 (moved to the paid `bitnamisecure` catalog); the archived copies
+  # live under `bitnamilegacy/*`. Pin the bundled subchart image there so a
+  # default install does not hit ImagePullBackOff. Override or run an external
+  # database (postgresql.enabled=false) for production.
+  image:
+    repository: bitnamilegacy/postgresql
+  auth:
+    username: nexspence
+    password: nexspence
+    database: nexspence
+  primary:
+    persistence:
+      enabled: true
+      size: 10Gi
+
+# -- External PostgreSQL DSN (used when postgresql.enabled=false)
+externalDatabase:
+  # -- Prefer existingSecret below — a plaintext value here (password
+  # included) tends to end up committed to a values file. Uncomment only if
+  # you genuinely have no existing Secret to point at.
+  # dsn: "postgres://nexspence:nexspence@external-postgres:5432/nexspence?sslmode=disable"
+  # -- Reference an existing Secret instead of putting the DSN directly in
+  # values. When set, the chart never composes NEXSPENCE_DATABASE_DSN itself —
+  # the Deployment reads it straight from this Secret via secretKeyRef.
+  existingSecret: ""
+  existingSecretKey: "dsn"
+
+# Image scanning (Trivy).
+#
+# Nexspence ships no scanner. Turning this on renders an initContainer that
+# copies the Trivy binary out of the image below into a shared volume, and
+# points nexspence at it. The image is pulled by your cluster from a third
+# party; you choose the version and you own updating it.
+#
+# Off means image scanning is unavailable and the UI says so. Scanning of
+# Maven, npm, PyPI and Cargo packages goes to OSV.dev over HTTPS and is
+# unaffected either way.
+scanning:
+  enabled: false
+  image:
+    repository: aquasec/trivy
+    # -- Pin to a digest for reproducible pulls, e.g. "0.70.0@sha256:...", same
+    # convention as the top-level image.tag.
+    tag: "0.70.0"
+    pullPolicy: IfNotPresent
+  # The binary is ~150 MB; the vulnerability database it downloads on first use
+  # lands in the existing cache volume.
+  volumeSize: 300Mi
+  # -- OCI refs for trivy-db. Empty = Trivy default (public GHCR).
+  dbRepository: []
+  #   - ghcr-proxy.example.com/aquasecurity/trivy-db:2
+  # -- OCI refs for trivy-java-db. Empty = Trivy default.
+  javaDbRepository: []
+  #   - ghcr-proxy.example.com/aquasecurity/trivy-java-db:1

@@ -1,0 +1,914 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path"
+	"strings"
+	"time"
+
+	"github.com/nexspence-oss/nexspence/internal/auth"
+	"github.com/nexspence-oss/nexspence/internal/config"
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/logger"
+	"github.com/nexspence-oss/nexspence/internal/repository"
+)
+
+// UserService handles user management and authentication.
+type UserService struct {
+	users              repository.UserRepo
+	roles              repository.RoleRepo
+	auth               *auth.Service
+	ldap               auth.LDAPAuthenticator // nil when LDAP is disabled
+	ldapCfg            config.LDAPConfig      // empty when LDAP is disabled
+	oidc               auth.OIDCAuthenticator // nil when OIDC is disabled
+	oidcCfg            config.OIDCConfig      // empty when OIDC is disabled
+	groups             auth.GroupLookup       // nil unless a directory lookup (Google Admin SDK) is configured
+	saml               auth.SAMLAuthenticator // nil when SAML is disabled
+	samlCfg            config.SAMLConfig      // empty when SAML is disabled
+	log                logger.Logger
+	basicAuthCache     *basicAuthVerificationCache
+	ldapBasicAuthCache *basicAuthVerificationCache
+	checkPassword      func(hash, password string) error
+}
+
+// NewUserService constructs a service for managing users, their passwords, and roles.
+func NewUserService(
+	users repository.UserRepo,
+	roles repository.RoleRepo,
+	auth *auth.Service,
+	log logger.Logger,
+) *UserService {
+	return &UserService{users: users, roles: roles, auth: auth, log: log, basicAuthCache: newBasicAuthVerificationCache(), checkPassword: auth.CheckPassword}
+}
+
+// WithLDAP attaches an LDAP authenticator and its config.
+// Returns the same service for chaining.
+func (s *UserService) WithLDAP(l auth.LDAPAuthenticator, cfg config.LDAPConfig) *UserService {
+	s.ldap = l
+	s.ldapCfg = cfg
+	if cfg.BasicAuthCacheTTL > 0 {
+		s.ldapBasicAuthCache = newBasicAuthVerificationCacheWithTTL(cfg.BasicAuthCacheTTL)
+	} else {
+		s.ldapBasicAuthCache = nil
+	}
+	return s
+}
+
+// WithOIDC attaches an OIDC authenticator and its config.
+// Returns the same service for chaining.
+func (s *UserService) WithOIDC(a auth.OIDCAuthenticator, cfg config.OIDCConfig) *UserService {
+	s.oidc = a
+	s.oidcCfg = cfg
+	return s
+}
+
+// WithGroupLookup attaches a directory lookup that supplies OIDC group
+// membership when the id_token carries none (Google Workspace). When set it
+// is the source of truth for groups on every OIDC login.
+func (s *UserService) WithGroupLookup(l auth.GroupLookup) *UserService {
+	s.groups = l
+	return s
+}
+
+// WithSAML attaches a SAML authenticator and its config.
+func (s *UserService) WithSAML(a auth.SAMLAuthenticator, cfg config.SAMLConfig) *UserService {
+	s.saml = a
+	s.samlCfg = cfg
+	return s
+}
+
+// Login validates credentials and returns a JWT token.
+// If LDAP is enabled, users with source=ldap (or unknown users) are authenticated
+// against the LDAP server; on success their local record is created/updated.
+func (s *UserService) Login(ctx context.Context, username, password string) (string, *domain.User, error) {
+	u, err := s.users.Get(ctx, username)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return "", nil, err
+	}
+
+	// Route to LDAP when: user is unknown and LDAP is on, or user has source=ldap.
+	if s.ldap != nil && (u == nil || u.Source == domain.UserSourceLDAP) {
+		// Normalize username to lowercase for LDAP to prevent duplicate rows
+		// caused by different capitalizations (e.g. "svcDevOps" vs "svcdevops").
+		normalized := strings.ToLower(username)
+		if u == nil && normalized != username {
+			u, err = s.users.Get(ctx, normalized)
+			if err != nil && !errors.Is(err, repository.ErrNotFound) {
+				return "", nil, err
+			}
+			// The lowercased name can belong to a local or SSO account. A
+			// directory entry of that name must not log in as it, nor rewrite
+			// its profile — the SSO logins refuse the same collision
+			// (GHSA-86xg-jx85-4hj7).
+			if u != nil && u.Source != domain.UserSourceLDAP {
+				return "", nil, fmt.Errorf("%w: %q is a %s account", ErrProvisioningConflict, normalized, u.Source)
+			}
+		}
+		return s.loginLDAP(ctx, normalized, password, u)
+	}
+
+	if u == nil {
+		return "", nil, fmt.Errorf("%w: user %q", ErrNotFound, username)
+	}
+	if u.Status != domain.UserStatusActive {
+		return "", nil, fmt.Errorf("%w: user account is not active", ErrInvalidInput)
+	}
+	if err := s.auth.CheckPassword(u.PasswordHash, password); err != nil {
+		return "", nil, err
+	}
+
+	token, err := s.auth.GenerateToken(u.ID, u.Username, u.Roles)
+	if err != nil {
+		return "", nil, err
+	}
+	_ = s.users.UpdateLastLogin(ctx, username)
+	return token, u, nil
+}
+
+// AuthenticateBasic validates Basic credentials for data routes without minting a JWT.
+// Successful local checks use the bounded local cache; LDAP checks are cached only
+// when ldap.basic_auth_cache_ttl is explicitly configured. The current user record
+// is loaded for every request so account status and roles remain current.
+func (s *UserService) AuthenticateBasic(ctx context.Context, username, password string) (*domain.User, error) {
+	u, err := s.users.Get(ctx, username)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return nil, err
+	}
+	if s.ldap != nil && u == nil && strings.ToLower(username) != username {
+		normalizedUser, normalizedErr := s.users.Get(ctx, strings.ToLower(username))
+		if normalizedErr != nil && !errors.Is(normalizedErr, repository.ErrNotFound) {
+			return nil, normalizedErr
+		}
+		if normalizedUser != nil && normalizedUser.Source == domain.UserSourceLDAP {
+			u = normalizedUser
+		}
+	}
+	if s.ldap != nil && (u == nil || u.Source == domain.UserSourceLDAP) {
+		if u != nil && u.Status != domain.UserStatusActive {
+			return nil, fmt.Errorf("%w: user account is not active", ErrInvalidInput)
+		}
+		if s.ldapBasicAuthCache != nil && u != nil && s.ldapBasicAuthCache.valid(strings.ToLower(username), password, u) {
+			if u.LastLogin == nil || time.Since(*u.LastLogin) >= time.Minute {
+				_ = s.users.UpdateLastLogin(ctx, u.Username)
+			}
+			return u, nil
+		}
+		_, ldapUser, loginErr := s.Login(ctx, username, password)
+		if loginErr == nil && ldapUser != nil && ldapUser.Source == domain.UserSourceLDAP && s.ldapBasicAuthCache != nil {
+			s.ldapBasicAuthCache.remember(ldapUser.Username, password, ldapUser)
+		}
+		return ldapUser, loginErr
+	}
+	if u == nil {
+		return nil, fmt.Errorf("%w: user %q", ErrNotFound, username)
+	}
+	cacheHit := s.basicAuthCache.valid(username, password, u)
+	if u.Status != domain.UserStatusActive {
+		return nil, fmt.Errorf("%w: user account is not active", ErrInvalidInput)
+	}
+	if !cacheHit {
+		if err := s.checkPassword(u.PasswordHash, password); err != nil {
+			return nil, err
+		}
+		s.basicAuthCache.remember(username, password, u)
+	}
+	if u.LastLogin == nil || time.Since(*u.LastLogin) >= time.Minute {
+		_ = s.users.UpdateLastLogin(ctx, username)
+	}
+	return u, nil
+}
+
+// loginLDAP authenticates via LDAP and upserts the local user record.
+func (s *UserService) loginLDAP(ctx context.Context, username, password string, existing *domain.User) (string, *domain.User, error) {
+	lu, err := s.ldap.Authenticate(ctx, username, password)
+	if err != nil {
+		return "", nil, fmt.Errorf("LDAP authentication failed: %w", err)
+	}
+
+	if existing == nil {
+		// Auto-create local record for the LDAP user.
+		existing = &domain.User{
+			Username:  username,
+			Email:     lu.Email,
+			FirstName: lu.FirstName,
+			LastName:  lu.LastName,
+			Status:    domain.UserStatusActive,
+			Source:    domain.UserSourceLDAP,
+		}
+		if err := s.users.Create(ctx, existing); err != nil {
+			return "", nil, fmt.Errorf("create ldap user: %w", err)
+		}
+	} else {
+		// Keep profile in sync with LDAP directory.
+		if lu.Email != "" {
+			existing.Email = lu.Email
+		}
+		if lu.FirstName != "" {
+			existing.FirstName = lu.FirstName
+		}
+		if lu.LastName != "" {
+			existing.LastName = lu.LastName
+		}
+		_ = s.users.Update(ctx, existing)
+	}
+
+	if existing.Status != domain.UserStatusActive {
+		return "", nil, fmt.Errorf("%w: user account is not active", ErrInvalidInput)
+	}
+
+	s.log.Infow("ldap user authenticated", "username", username, "ldap_groups", lu.Groups, "user_dn", lu.DN)
+
+	// Best-effort: sync roles from LDAP groups (by name, role_mappings, admin_group).
+	// Only a completed search is evidence of membership: a failed search or an
+	// unconfigured one says nothing about the user's groups, so REPLACE would
+	// silently wipe manually-assigned roles (#488).
+	switch {
+	case lu.GroupSearchErr != "":
+		s.log.Warnw("ldap group search failed; leaving existing role assignments untouched",
+			"username", username, "err", lu.GroupSearchErr)
+	case !lu.GroupsSearched:
+		// group_base/group_filter not configured → nothing to sync from.
+	default:
+		if err := s.syncLDAPRoles(ctx, existing.ID, lu.Groups); err != nil {
+			s.log.Warnw("syncLDAPRoles failed", "username", username, "err", err)
+		}
+	}
+
+	// Reload roles so the JWT reflects any just-granted nx-admin role.
+	if fresh, err2 := s.roles.GetUserRoles(ctx, existing.ID); err2 == nil {
+		names := make([]string, 0, len(fresh))
+		for _, r := range fresh {
+			names = append(names, r.Name)
+		}
+		existing.Roles = names
+	}
+
+	s.log.Infow("ldap login complete", "username", username, "roles", existing.Roles)
+
+	token, err := s.auth.GenerateToken(existing.ID, existing.Username, existing.Roles)
+	if err != nil {
+		return "", nil, err
+	}
+	_ = s.users.UpdateLastLogin(ctx, username)
+	return token, existing, nil
+}
+
+// syncLDAPRoles replaces the user's roles with those derived from LDAP group membership.
+// Resolution order (all applied, REPLACE semantics):
+//  1. admin_group match → nx-admin
+//  2. role_mappings[group] → mapped role name
+//  3. group name matches a role name exactly → that role
+func (s *UserService) syncLDAPRoles(ctx context.Context, userID string, ldapGroups []string) error {
+	want := make(map[string]struct{})
+	for _, g := range ldapGroups {
+		// 1. admin group
+		if s.ldapCfg.AdminGroup != "" && ldapGroupMatch(g, s.ldapCfg.AdminGroup) {
+			want["nx-admin"] = struct{}{}
+		}
+		// 2. explicit role_mappings
+		for mapKey, roleName := range s.ldapCfg.RoleMappings {
+			if roleName != "" && ldapGroupMatch(g, mapKey) {
+				want[roleName] = struct{}{}
+			}
+		}
+		// 3. implicit by-name: group name = role name
+		want[g] = struct{}{}
+	}
+
+	allRoles, err := s.roles.List(ctx)
+	if err != nil {
+		return err
+	}
+	ids := make([]string, 0, len(want))
+	for _, r := range allRoles {
+		if _, ok := want[r.Name]; ok {
+			ids = append(ids, r.ID)
+		}
+	}
+	s.log.Infow("ldap role sync", "user", userID, "ldap_groups", ldapGroups, "assigned_role_ids", ids)
+	return s.roles.SetUserRoles(ctx, userID, ids)
+}
+
+// ValidateToken validates a JWT and returns the embedded claims.
+func (s *UserService) ValidateToken(tokenStr string) (*auth.Claims, error) {
+	return s.auth.ValidateToken(tokenStr)
+}
+
+// List returns users, optionally filtered by source (local, ldap, oidc).
+func (s *UserService) List(ctx context.Context, source string) ([]domain.User, error) {
+	return s.users.List(ctx, source)
+}
+
+// Get returns the user with the given username, or ErrNotFound if none exists.
+func (s *UserService) Get(ctx context.Context, username string) (*domain.User, error) {
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	if u == nil {
+		return nil, fmt.Errorf("%w: user %q", ErrNotFound, username)
+	}
+	return u, nil
+}
+
+// GetByID returns the user with the given id, or ErrNotFound if none exists.
+func (s *UserService) GetByID(ctx context.Context, id string) (*domain.User, error) {
+	u, err := s.users.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if u == nil {
+		return nil, fmt.Errorf("%w: user id %q", ErrNotFound, id)
+	}
+	return u, nil
+}
+
+// validatePasswordLength rejects a non-empty password below the configured
+// auth.password_min_length. The setting existed in config for ages and was
+// never enforced anywhere — this is the single place that gives it effect.
+// An empty password passes: provisioning paths (SSO JIT, migrated external
+// accounts) deliberately create users with no local credential, and min
+// length 0 means the auth.Service was never wired with a value.
+func (s *UserService) validatePasswordLength(plain string) error {
+	minLen := s.auth.MinPasswordLength()
+	if minLen <= 0 || plain == "" {
+		return nil
+	}
+	if len(plain) < minLen {
+		return fmt.Errorf("%w: must be at least %d characters", ErrPasswordTooShort, minLen)
+	}
+	return nil
+}
+
+// requireLocalPassword checks that a user's credential is actually a local
+// one before a password write. ldap/oidc/saml accounts are re-authenticated
+// by their identity provider — the login flow never compares against the
+// stored hash for them — so a "successful" local password change would be a
+// silent lie. Fail closed here, in the service, so a direct API call cannot
+// bypass it either.
+func (s *UserService) requireLocalPassword(u *domain.User) error {
+	if u.Source != domain.UserSourceLocal {
+		return fmt.Errorf("%w: %s account", ErrPasswordManagedExternally, u.Source)
+	}
+	return nil
+}
+
+// Create persists a new user, hashing plainPassword (if given) and assigning roles.
+func (s *UserService) Create(ctx context.Context, u *domain.User, plainPassword string) error {
+	if u.Username == "" {
+		return fmt.Errorf("%w: username is required", ErrInvalidInput)
+	}
+	// POST/PUT parity: the same minimum the change-password verbs enforce.
+	if err := s.validatePasswordLength(plainPassword); err != nil {
+		return err
+	}
+
+	existing, err := s.users.Get(ctx, u.Username)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return err
+	}
+	if existing != nil {
+		return fmt.Errorf("%w: user %q", ErrAlreadyExists, u.Username)
+	}
+
+	if plainPassword != "" {
+		hash, err := s.auth.HashPassword(plainPassword)
+		if err != nil {
+			return err
+		}
+		u.PasswordHash = hash
+	}
+
+	if u.Status == "" {
+		u.Status = domain.UserStatusActive
+	}
+	if u.Source == "" {
+		u.Source = domain.UserSourceLocal
+	}
+
+	if err := s.users.Create(ctx, u); err != nil {
+		// The username was pre-checked above, but email uniqueness is enforced
+		// only by the DB (a partial index, so any number of email-less users is
+		// still fine). Without this, a duplicate email escaped as a raw driver
+		// error and the handler answered 500 with SQL internals instead of 409.
+		var uv *repository.UniqueViolationError
+		if errors.As(err, &uv) {
+			return fmt.Errorf("%w: user with this %s", ErrAlreadyExists, uv.Field)
+		}
+		return err
+	}
+	if len(u.Roles) > 0 {
+		if err := s.roles.SetUserRoles(ctx, u.ID, u.Roles); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Update applies the non-empty fields of updates to the named user and persists it.
+func (s *UserService) Update(ctx context.Context, username string, updates *domain.User) (*domain.User, error) {
+	u, err := s.Get(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+
+	if updates.Email != "" {
+		u.Email = updates.Email
+	}
+	if updates.FirstName != "" {
+		u.FirstName = updates.FirstName
+	}
+	if updates.LastName != "" {
+		u.LastName = updates.LastName
+	}
+	disabled := false
+	if updates.Status != "" {
+		if u.Status == domain.UserStatusActive && updates.Status != domain.UserStatusActive {
+			disabled = true
+		}
+		u.Status = updates.Status
+	}
+
+	if err := s.users.Update(ctx, u); err != nil {
+		// Same email collision as Create's, on the sibling verb.
+		var uv *repository.UniqueViolationError
+		if errors.As(err, &uv) {
+			return nil, fmt.Errorf("%w: user with this %s", ErrAlreadyExists, uv.Field)
+		}
+		return nil, err
+	}
+	// Revoke existing JWTs when the account transitions to non-active.
+	if disabled {
+		if err := s.users.BumpTokensValidAfter(ctx, u.ID); err != nil {
+			s.log.Warnw("BumpTokensValidAfter failed after disable", "user", u.ID, "err", err)
+		}
+	}
+	return u, nil
+}
+
+// ChangePassword verifies the current password before setting a new one.
+func (s *UserService) ChangePassword(ctx context.Context, username, oldPassword, newPassword string) error {
+	u, err := s.Get(ctx, username)
+	if err != nil {
+		return err
+	}
+	// Before bcrypt: an ldap/oidc/saml account has an empty local hash, so the
+	// check below would answer the confusing "invalid password" instead of the
+	// truth — the identity provider owns this credential.
+	if err := s.requireLocalPassword(u); err != nil {
+		return err
+	}
+	if err := s.auth.CheckPassword(u.PasswordHash, oldPassword); err != nil {
+		return err
+	}
+	if err := s.validatePasswordLength(newPassword); err != nil {
+		return err
+	}
+	hash, err := s.auth.HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	if err := s.users.UpdatePassword(ctx, username, hash); err != nil {
+		return err
+	}
+	// Revoke existing JWTs on password change.
+	if err := s.users.BumpTokensValidAfter(ctx, u.ID); err != nil {
+		s.log.Warnw("BumpTokensValidAfter failed after password change", "user", u.ID, "err", err)
+	}
+	return nil
+}
+
+// SetPassword overwrites a user's password without requiring the current one (admin reset).
+func (s *UserService) SetPassword(ctx context.Context, username, newPassword string) error {
+	u, err := s.Get(ctx, username)
+	if err != nil {
+		return err
+	}
+	// Server-side, not just in the UI: resetting an SSO account used to write a
+	// local hash the login flow never checks — the reset "succeeded" and did
+	// nothing. The identity provider owns that credential.
+	if err := s.requireLocalPassword(u); err != nil {
+		return err
+	}
+	if err := s.validatePasswordLength(newPassword); err != nil {
+		return err
+	}
+	hash, err := s.auth.HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	if err := s.users.UpdatePassword(ctx, username, hash); err != nil {
+		return err
+	}
+	// Revoke existing JWTs on admin password reset.
+	if err := s.users.BumpTokensValidAfter(ctx, u.ID); err != nil {
+		s.log.Warnw("BumpTokensValidAfter failed after password reset", "user", u.ID, "err", err)
+	}
+	return nil
+}
+
+// Delete removes the named user.
+func (s *UserService) Delete(ctx context.Context, username string) error {
+	_, err := s.Get(ctx, username)
+	if err != nil {
+		return err
+	}
+	return s.users.Delete(ctx, username)
+}
+
+// GetUserRoles returns the roles assigned to the given user.
+func (s *UserService) GetUserRoles(ctx context.Context, userID string) ([]domain.Role, error) {
+	return s.roles.GetUserRoles(ctx, userID)
+}
+
+// SetUserRoles replaces the user's role assignments with the given role ids.
+func (s *UserService) SetUserRoles(ctx context.Context, userID string, roleIDs []string) error {
+	if err := s.roles.SetUserRoles(ctx, userID, roleIDs); err != nil {
+		return err
+	}
+	// Revoke existing JWTs so the new role set takes effect immediately
+	// (a JWT embeds the roles it was issued with).
+	if err := s.users.BumpTokensValidAfter(ctx, userID); err != nil {
+		s.log.Warnw("BumpTokensValidAfter failed after role change", "user", userID, "err", err)
+	}
+	return nil
+}
+
+// externalIDConflict refuses a login whose identity does not match the one
+// the account is bound to.
+//
+// The username is the mutable half of a login; the subject (the OIDC `sub`
+// claim, the SAML NameID) is the immutable one. An IdP may hand the same
+// username to a different principal — the employee left, the address was
+// recycled, the directory was renamed — and the account, with the roles on
+// it, must not follow.
+func externalIDConflict(u *domain.User, subject string) error {
+	if u == nil || subject == "" || u.ExternalID == "" || u.ExternalID == subject {
+		return nil
+	}
+	return fmt.Errorf("%w: username %q is bound to a different identity", ErrProvisioningConflict, u.Username)
+}
+
+// recordExternalID binds the identity the IdP vouches for to the account.
+//
+// An account provisioned before the subject was recorded has nothing to
+// compare against: it binds here, on its next login, and the check applies
+// from then on.
+func (s *UserService) recordExternalID(ctx context.Context, u *domain.User, subject string) error {
+	if subject == "" || u.ExternalID == subject {
+		return nil
+	}
+	if err := s.users.SetExternalID(ctx, u.ID, subject); err != nil {
+		return fmt.Errorf("record the identity of %q: %w", u.Username, err)
+	}
+	u.ExternalID = subject
+	return nil
+}
+
+// LoginOIDC upserts the user and assigns roles based on OIDC claims.
+// Roles are REPLACED (not merged) on every login — IdP is source of truth.
+func (s *UserService) LoginOIDC(ctx context.Context, claims *auth.OIDCClaims, rawIDToken string) (string, *domain.User, error) {
+	if s.oidc == nil {
+		return "", nil, fmt.Errorf("%w: oidc not configured", ErrInvalidInput)
+	}
+	username := strings.ToLower(strings.TrimSpace(claims.Username))
+	email := strings.ToLower(strings.TrimSpace(claims.Email))
+	if username == "" || email == "" {
+		return "", nil, fmt.Errorf("%w: claims missing username or email", ErrInvalidInput)
+	}
+
+	existing, err := s.users.Get(ctx, username)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return "", nil, err
+	}
+	if existing != nil && existing.Source != domain.UserSourceOIDC {
+		return "", nil, fmt.Errorf("%w: username %q is claimed by %s",
+			ErrProvisioningConflict, username, existing.Source)
+	}
+	if err := externalIDConflict(existing, claims.Subject); err != nil {
+		return "", nil, err
+	}
+
+	if existing == nil {
+		if err := s.checkProvisioning(email); err != nil {
+			return "", nil, err
+		}
+		existing = &domain.User{
+			Username:  username,
+			Email:     email,
+			FirstName: claims.FirstName,
+			LastName:  claims.LastName,
+			Status:    domain.UserStatusActive,
+			Source:    domain.UserSourceOIDC,
+		}
+		if err := s.users.Create(ctx, existing); err != nil {
+			return "", nil, fmt.Errorf("create oidc user: %w", err)
+		}
+	} else {
+		existing.Email = email
+		existing.FirstName = claims.FirstName
+		existing.LastName = claims.LastName
+		_ = s.users.Update(ctx, existing)
+	}
+	if err := s.recordExternalID(ctx, existing, claims.Subject); err != nil {
+		return "", nil, err
+	}
+
+	if existing.Status != domain.UserStatusActive {
+		return "", nil, fmt.Errorf("%w: user account is not active", ErrInvalidInput)
+	}
+
+	groups, groupsPresent := claims.Groups, claims.GroupsPresent
+	if s.groups != nil {
+		// The directory, not the token, is the source of truth. A failed
+		// lookup is "no answer": leave roles as they are rather than lock the
+		// user out or wipe what an admin granted (#483).
+		if found, lerr := s.groups.Groups(ctx, email); lerr != nil {
+			s.log.Warnw("oidc group lookup failed; leaving existing role assignments untouched",
+				"username", username, "err", lerr)
+			groups, groupsPresent = nil, false
+		} else {
+			groups, groupsPresent = found, true
+		}
+	}
+	if err := s.syncOIDCRoles(ctx, existing.ID, groups, groupsPresent); err != nil {
+		s.log.Warnw("syncOIDCRoles failed", "username", username, "err", err)
+	}
+
+	// Reload roles from DB — SetUserRoles does not update in-memory user.
+	if fresh, err2 := s.roles.GetUserRoles(ctx, existing.ID); err2 == nil {
+		names := make([]string, 0, len(fresh))
+		for _, r := range fresh {
+			names = append(names, r.Name)
+		}
+		existing.Roles = names
+	}
+
+	s.log.Infow("oidc login complete", "username", username, "roles", existing.Roles)
+
+	token, err := s.auth.GenerateTokenWithMethod(existing.ID, existing.Username, existing.Roles, "oidc")
+	if err != nil {
+		return "", nil, err
+	}
+	if err2 := s.users.SetOIDCTokens(ctx, existing.ID, rawIDToken, ""); err2 != nil {
+		s.log.Warnw("SetOIDCTokens failed", "username", username, "err", err2)
+	}
+	_ = s.users.UpdateLastLogin(ctx, username)
+	return token, existing, nil
+}
+
+// checkProvisioning gates new-user creation based on oidc.provisioning mode.
+func (s *UserService) checkProvisioning(email string) error {
+	mode := s.oidcCfg.Provisioning
+	if mode == "" {
+		mode = "jit"
+	}
+	switch mode {
+	case "jit":
+		return nil
+	case "allowlist":
+		for _, pat := range s.oidcCfg.EmailAllowlist {
+			ok, _ := path.Match(strings.ToLower(pat), email)
+			if ok {
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: email %q not in allowlist", ErrProvisioningRejected, email)
+	case "manual":
+		return fmt.Errorf("%w: user must be pre-created by an admin", ErrProvisioningRejected)
+	default:
+		return fmt.Errorf("%w: unknown provisioning mode %q", ErrInvalidInput, mode)
+	}
+}
+
+// syncOIDCRoles replaces the user's roles with those derived from claims.
+// Collection: admin_group match → nx-admin; role_mappings lookup by claim value
+// (with DN-aware comparison via oidcGroupMatch) → mapped role name. When the
+// id_token carries no claim under GroupsClaim at all (groupsPresent is
+// false), this is a no-op: the IdP gave no group info for this login, so any
+// manually-assigned roles are left untouched rather than wiped to empty.
+func (s *UserService) syncOIDCRoles(ctx context.Context, userID string, groups []string, groupsPresent bool) error {
+	if !groupsPresent {
+		if s.oidcCfg.GroupsClaim != "" {
+			s.log.Warnw("oidc id_token has no groups claim; leaving existing role assignments untouched",
+				"user", userID, "groups_claim", s.oidcCfg.GroupsClaim)
+		}
+		return nil
+	}
+
+	want := make(map[string]struct{})
+	for _, g := range groups {
+		if s.oidcCfg.AdminGroup != "" && oidcGroupMatch(g, s.oidcCfg.AdminGroup) {
+			want["nx-admin"] = struct{}{}
+		}
+		for mapKey, roleName := range s.oidcCfg.RoleMappings {
+			if roleName != "" && oidcGroupMatch(g, mapKey) {
+				want[roleName] = struct{}{}
+			}
+		}
+	}
+
+	allRoles, err := s.roles.List(ctx)
+	if err != nil {
+		return err
+	}
+	ids := make([]string, 0, len(want))
+	matched := make(map[string]bool)
+	for _, r := range allRoles {
+		if _, ok := want[r.Name]; ok {
+			ids = append(ids, r.ID)
+			matched[r.Name] = true
+		}
+	}
+	for name := range want {
+		if !matched[name] {
+			s.log.Warnw("oidc role mapping references unknown role", "role", name)
+		}
+	}
+	return s.roles.SetUserRoles(ctx, userID, ids)
+}
+
+// oidcGroupMatch is bidirectional: both args may be plain names or DN-encoded
+// ("CN=value,OU=..."). The first RDN value of a DN is compared.
+func oidcGroupMatch(a, b string) bool {
+	return strings.EqualFold(stripCNPrefix(a), stripCNPrefix(b))
+}
+
+func stripCNPrefix(s string) string {
+	if idx := strings.IndexByte(s, '='); idx >= 0 {
+		val := s[idx+1:]
+		if end := strings.IndexByte(val, ','); end >= 0 {
+			val = val[:end]
+		}
+		return val
+	}
+	return s
+}
+
+// ldapGroupMatch compares a group name returned by LDAP against the configured
+// admin_group value. It handles two forms:
+//   - plain name:  "nexus-administrators"
+//   - full LDAP DN: "CN=nexus-administrators,OU=…,DC=…" — only the first RDN value is used
+//
+// Comparison is case-insensitive in both cases.
+func ldapGroupMatch(name, configured string) bool {
+	if strings.EqualFold(name, configured) {
+		return true
+	}
+	// Extract value of the first RDN attribute from a DN (e.g. "CN=foo,OU=bar" → "foo").
+	if idx := strings.IndexByte(configured, '='); idx >= 0 {
+		val := configured[idx+1:]
+		if end := strings.IndexByte(val, ','); end >= 0 {
+			val = val[:end]
+		}
+		if strings.EqualFold(name, val) {
+			return true
+		}
+	}
+	return false
+}
+
+// LoginSAML upserts the user and assigns roles based on SAML assertion claims.
+// Roles are REPLACED on every login — IdP is source of truth.
+func (s *UserService) LoginSAML(ctx context.Context, claims *auth.SAMLClaims) (string, *domain.User, error) {
+	if s.saml == nil {
+		return "", nil, fmt.Errorf("%w: saml not configured", ErrInvalidInput)
+	}
+	username := strings.ToLower(strings.TrimSpace(claims.Username))
+	email := strings.ToLower(strings.TrimSpace(claims.Email))
+	if username == "" || email == "" {
+		return "", nil, fmt.Errorf("%w: saml claims missing username or email", ErrInvalidInput)
+	}
+
+	existing, err := s.users.Get(ctx, username)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return "", nil, err
+	}
+	if existing != nil && existing.Source != domain.UserSourceSAML {
+		return "", nil, fmt.Errorf("%w: username %q is claimed by %s",
+			ErrProvisioningConflict, username, existing.Source)
+	}
+	if err := externalIDConflict(existing, claims.Subject); err != nil {
+		return "", nil, err
+	}
+
+	if existing == nil {
+		if err := s.checkSAMLProvisioning(email); err != nil {
+			return "", nil, err
+		}
+		existing = &domain.User{
+			Username:  username,
+			Email:     email,
+			FirstName: claims.Name, // store display name in FirstName
+			Status:    domain.UserStatusActive,
+			Source:    domain.UserSourceSAML,
+		}
+		if err := s.users.Create(ctx, existing); err != nil {
+			return "", nil, fmt.Errorf("create saml user: %w", err)
+		}
+	} else {
+		existing.Email = email
+		existing.FirstName = claims.Name
+		_ = s.users.Update(ctx, existing)
+	}
+	if err := s.recordExternalID(ctx, existing, claims.Subject); err != nil {
+		return "", nil, err
+	}
+
+	if existing.Status != domain.UserStatusActive {
+		return "", nil, fmt.Errorf("%w: user account is not active", ErrInvalidInput)
+	}
+
+	if err := s.syncSAMLRoles(ctx, existing.ID, claims.Groups, claims.GroupsPresent); err != nil {
+		s.log.Warnw("syncSAMLRoles failed", "username", username, "err", err)
+	}
+
+	// Reload roles from DB — SetUserRoles does not update the in-memory user.
+	if fresh, err2 := s.roles.GetUserRoles(ctx, existing.ID); err2 == nil {
+		names := make([]string, 0, len(fresh))
+		for _, r := range fresh {
+			names = append(names, r.Name)
+		}
+		existing.Roles = names
+	}
+
+	s.log.Infow("saml login complete", "username", username, "roles", existing.Roles)
+
+	token, err := s.auth.GenerateTokenWithMethod(existing.ID, existing.Username, existing.Roles, "saml")
+	if err != nil {
+		return "", nil, err
+	}
+	_ = s.users.UpdateLastLogin(ctx, username)
+	return token, existing, nil
+}
+
+// checkSAMLProvisioning gates new-user creation based on saml.provisioning mode.
+func (s *UserService) checkSAMLProvisioning(email string) error {
+	mode := s.samlCfg.Provisioning
+	if mode == "" {
+		mode = "jit"
+	}
+	switch mode {
+	case "jit":
+		return nil
+	case "allowlist":
+		for _, pat := range s.samlCfg.EmailAllowlist {
+			ok, _ := path.Match(strings.ToLower(pat), email)
+			if ok {
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: email %q not in allowlist", ErrProvisioningRejected, email)
+	case "manual":
+		return fmt.Errorf("%w: user must be pre-created by an admin", ErrProvisioningRejected)
+	default:
+		return fmt.Errorf("%w: unknown saml provisioning mode %q", ErrInvalidInput, mode)
+	}
+}
+
+// syncSAMLRoles replaces the user's roles derived from SAML groups.
+// REPLACE semantics: IdP is source of truth. When the assertion carries no
+// attribute under GroupsAttribute at all (groupsPresent is false), this is a
+// no-op — see syncOIDCRoles for the same reasoning.
+func (s *UserService) syncSAMLRoles(ctx context.Context, userID string, groups []string, groupsPresent bool) error {
+	if !groupsPresent {
+		if s.samlCfg.GroupsAttribute != "" {
+			s.log.Warnw("saml assertion has no groups attribute; leaving existing role assignments untouched",
+				"user", userID, "groups_attribute", s.samlCfg.GroupsAttribute)
+		}
+		return nil
+	}
+
+	want := make(map[string]struct{})
+	for _, g := range groups {
+		if s.samlCfg.AdminGroup != "" && strings.EqualFold(g, s.samlCfg.AdminGroup) {
+			want["nx-admin"] = struct{}{}
+		}
+		for mapKey, roleName := range s.samlCfg.RoleMappings {
+			if roleName != "" && strings.EqualFold(g, mapKey) {
+				want[roleName] = struct{}{}
+			}
+		}
+	}
+
+	allRoles, err := s.roles.List(ctx)
+	if err != nil {
+		return err
+	}
+	ids := make([]string, 0, len(want))
+	matched := make(map[string]bool)
+	for _, r := range allRoles {
+		if _, ok := want[r.Name]; ok {
+			ids = append(ids, r.ID)
+			matched[r.Name] = true
+		}
+	}
+	for name := range want {
+		if !matched[name] {
+			s.log.Warnw("saml role mapping references unknown role", "role", name)
+		}
+	}
+	return s.roles.SetUserRoles(ctx, userID, ids)
+}

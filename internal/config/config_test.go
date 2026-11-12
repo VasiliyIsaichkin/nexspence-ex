@@ -1,0 +1,810 @@
+package config
+
+import (
+	"encoding/base64"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// validBase64Key32 returns a 32-byte base64 key suitable for OIDC cookie_key.
+func validBase64Key32() string {
+	b := make([]byte, 32)
+	for i := range b {
+		b[i] = byte(i)
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+func validOIDC() OIDCConfig {
+	return OIDCConfig{
+		Enabled:         true,
+		Issuer:          "https://idp.example.com",
+		ClientID:        "nexspence",
+		ClientSecret:    "s3cret",
+		RedirectURL:     "https://app/cb",
+		FrontendBaseURL: "https://app",
+		Provisioning:    "jit",
+		CookieKey:       validBase64Key32(),
+		Scopes:          []string{"openid", "profile", "email"},
+	}
+}
+
+func TestValidateOIDC_Disabled_AlwaysPasses(t *testing.T) {
+	c := OIDCConfig{Enabled: false} // all other fields empty
+	require.NoError(t, ValidateOIDC(c))
+}
+
+func TestValidateOIDC_MissingIssuer_FailsWhenEnabled(t *testing.T) {
+	c := validOIDC()
+	c.Issuer = ""
+	err := ValidateOIDC(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "oidc.issuer")
+}
+
+func TestValidateOIDC_MissingClientID_FailsWhenEnabled(t *testing.T) {
+	c := validOIDC()
+	c.ClientID = ""
+	err := ValidateOIDC(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "client_id")
+}
+
+func TestValidateOIDC_MissingRedirectURL_FailsWhenEnabled(t *testing.T) {
+	c := validOIDC()
+	c.RedirectURL = ""
+	err := ValidateOIDC(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "redirect_url")
+}
+
+func TestValidateOIDC_AllowlistEmpty_FailsWhenMode(t *testing.T) {
+	c := validOIDC()
+	c.Provisioning = "allowlist"
+	c.EmailAllowlist = nil
+	err := ValidateOIDC(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "email_allowlist")
+}
+
+func TestValidateOIDC_Allowlist_PassesWithEntries(t *testing.T) {
+	c := validOIDC()
+	c.Provisioning = "allowlist"
+	c.EmailAllowlist = []string{"*@company.com"}
+	require.NoError(t, ValidateOIDC(c))
+}
+
+func TestValidateOIDC_CookieKey_InvalidBase64_Fails(t *testing.T) {
+	c := validOIDC()
+	c.CookieKey = "not@base64!!"
+	err := ValidateOIDC(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cookie_key")
+}
+
+func TestValidateOIDC_CookieKey_WrongLength_Fails(t *testing.T) {
+	c := validOIDC()
+	// 16-byte key — valid base64 but wrong length for AES-256.
+	c.CookieKey = base64.StdEncoding.EncodeToString(make([]byte, 16))
+	err := ValidateOIDC(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cookie_key")
+}
+
+func TestValidateOIDC_FullValidConfig_Passes(t *testing.T) {
+	c := validOIDC()
+	c.Provisioning = "jit"
+	c.GroupsClaim = "groups"
+	c.AdminGroup = "admins"
+	c.RoleMappings = map[string]string{"developers": "release-manager"}
+	c.ShowLoginButton = true
+	c.CookieSecure = true
+	c.AllowedSkewSeconds = 60
+	require.NoError(t, ValidateOIDC(c))
+}
+
+func validAuth() AuthConfig {
+	return AuthConfig{JWTSecret: "a-sufficiently-long-unique-secret-value-123"}
+}
+
+func TestValidateAuth_Empty_Fails(t *testing.T) {
+	err := ValidateAuth(AuthConfig{JWTSecret: ""})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "jwt_secret")
+}
+
+func TestValidateAuth_Placeholder_Fails(t *testing.T) {
+	err := ValidateAuth(AuthConfig{JWTSecret: "CHANGE_ME_AT_LEAST_32_CHARACTERS_LONG"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "placeholder")
+}
+
+func TestValidateAuth_TooShort_Fails(t *testing.T) {
+	err := ValidateAuth(AuthConfig{JWTSecret: "short"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "32")
+}
+
+func TestValidateAuth_Valid_Passes(t *testing.T) {
+	require.NoError(t, ValidateAuth(validAuth()))
+}
+
+func TestValidateAuth_EncryptionKey_Valid_Passes(t *testing.T) {
+	c := validAuth()
+	c.EncryptionKey = base64.StdEncoding.EncodeToString(make([]byte, 32))
+	require.NoError(t, ValidateAuth(c))
+}
+
+func TestValidateAuth_EncryptionKey_WrongLength_Fails(t *testing.T) {
+	c := validAuth()
+	c.EncryptionKey = base64.StdEncoding.EncodeToString(make([]byte, 16))
+	err := ValidateAuth(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "auth.encryption_key must be base64-encoded 32 bytes")
+}
+
+func TestValidateAuth_EncryptionKey_NotBase64_Fails(t *testing.T) {
+	c := validAuth()
+	c.EncryptionKey = "%%%not-base64%%%"
+	err := ValidateAuth(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "auth.encryption_key must be base64-encoded 32 bytes")
+}
+
+func TestDevDefaultJWTSecret_PassesValidation_ButRecognized(t *testing.T) {
+	require.NoError(t, ValidateAuth(AuthConfig{JWTSecret: DevDefaultJWTSecret}),
+		"dev default must pass ValidateAuth so quick-start boots")
+	require.True(t, IsDevDefaultJWTSecret(DevDefaultJWTSecret))
+	require.False(t, IsDevDefaultJWTSecret("some-other-unique-production-secret-value"))
+	require.NotEqual(t, exampleJWTSecret, DevDefaultJWTSecret)
+}
+
+func TestLoad_AllowInsecureDefaults_DefaultsFalse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Auth.AllowInsecureDefaults,
+		"auth.allow_insecure_defaults must default to false (fail-closed)")
+}
+
+func TestLoad_LDAPBasicAuthCacheTTLDefaultsToDisabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Zero(t, cfg.LDAP.BasicAuthCacheTTL)
+}
+
+func TestLoad_LDAPBasicAuthCacheTTLRejectsValuesOverOneMinute(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n" +
+		"ldap:\n  basic_auth_cache_ttl: 61s\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	_, err := Load(path)
+	require.ErrorContains(t, err, "ldap.basic_auth_cache_ttl must be between 0s and 1m")
+}
+
+func TestLoad_GCDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.GC.Enabled, "gc.enabled default should be true")
+	assert.Equal(t, "0 3 * * 0", cfg.GC.Schedule)
+	assert.Equal(t, 24*time.Hour, cfg.GC.MinAge)
+}
+
+func TestLoad_PromotionDefaultsAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 30*time.Second, cfg.Promotion.AutoSettleWindow)
+	assert.Equal(t, time.Hour, cfg.Promotion.AutoScanWait)
+	assert.Equal(t, 5*time.Second, cfg.Promotion.AutoPollInterval)
+
+	// The Helm chart sets these by environment variable.
+	t.Setenv("NEXSPENCE_PROMOTION_AUTO_SETTLE_WINDOW", "2m")
+	cfg, err = Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 2*time.Minute, cfg.Promotion.AutoSettleWindow)
+}
+
+// Automatic scanning is on out of the box: an unscanned upload is the state
+// this feature exists to prevent, so opting in is the wrong default.
+func TestLoad_ScanDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.Scan.Enabled, "scan.enabled default should be true")
+	assert.Equal(t, "0 3 * * *", cfg.Scan.Schedule)
+}
+
+func TestLoad_ScanCanBeDisabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n" +
+		"scan:\n  enabled: false\n  schedule: \"0 4 * * *\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Scan.Enabled)
+	assert.Equal(t, "0 4 * * *", cfg.Scan.Schedule)
+}
+
+func TestLoad_RateLimit_DefaultsEnabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.Auth.RateLimitEnabled,
+		"auth.rate_limit_enabled must default to true: /api/v1/login is otherwise an unmetered bcrypt-cost-12 surface")
+}
+
+func TestLoad_TrustedProxies_DefaultsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Empty(t, cfg.HTTP.TrustedProxies,
+		"http.trusted_proxies must default to empty so X-Forwarded-For is not believed")
+}
+
+func TestLoad_TrustedProxies_EnvOverride(t *testing.T) {
+	// Viper skips keys with no default when unmarshalling with AutomaticEnv,
+	// so this also guards the SetDefault that makes the env var resolvable.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	t.Setenv("NEXSPENCE_HTTP_TRUSTED_PROXIES", "10.0.0.0/8,192.168.1.1")
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"10.0.0.0/8", "192.168.1.1"}, cfg.HTTP.TrustedProxies)
+}
+
+// The Prometheus scrape endpoint stays behind Bearer auth unless an operator
+// opts out: it is served on the same public listener as the rest of the API,
+// so an anonymous /metrics would publish install size and Go runtime details.
+func TestLoad_MetricsPublic_DefaultsFalse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Metrics.Public,
+		"metrics.public must default to false so /metrics keeps requiring a Bearer token")
+}
+
+func TestLoad_MetricsPublic_FromFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n" +
+		"metrics:\n  public: true\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.Metrics.Public)
+}
+
+func TestLoad_MetricsPublic_EnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	t.Setenv("NEXSPENCE_METRICS_PUBLIC", "true")
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.Metrics.Public)
+}
+
+func TestLoad_AllowInsecureDefaults_EnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	t.Setenv("NEXSPENCE_AUTH_ALLOW_INSECURE_DEFAULTS", "true")
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.Auth.AllowInsecureDefaults)
+}
+
+// The /v2/ upload paths are exempt from http.max_body_mb so large image layers
+// are not truncated, so this cap is the only thing bounding a staged upload —
+// it ships on by default rather than as an opt-in hardening step.
+func TestLoad_DockerMaxUploadBytes_Default(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, int64(10<<30), cfg.Docker.MaxUploadBytes)
+}
+
+func TestLoad_DockerMaxUploadBytes_Configurable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n" +
+		"docker:\n  max_upload_bytes: 1048576\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1048576), cfg.Docker.MaxUploadBytes)
+}
+
+// A Helm proxy resolves the origin of every uncached chart out of the upstream
+// index, so the index is fetched on the download path too. The cache that keeps
+// that from being one download per pull ships on, and an operator who would
+// rather pay the traffic than wait out the window can shorten it or set 0.
+func TestLoad_HelmIndexCacheTTL(t *testing.T) {
+	const base = "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+
+	t.Run("default", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(base), 0o600))
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, 5*time.Minute, cfg.Helm.IndexCacheTTL)
+	})
+
+	t.Run("from the config file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(base+"helm:\n  index_cache_ttl: 30s\n"), 0o600))
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, 30*time.Second, cfg.Helm.IndexCacheTTL)
+	})
+
+	t.Run("from the environment", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(base), 0o600))
+		t.Setenv("NEXSPENCE_HELM_INDEX_CACHE_TTL", "0s")
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Zero(t, cfg.Helm.IndexCacheTTL, "0 must reach the server as caching off")
+	})
+}
+
+// The bootstrap admin exists so a fresh install has someone to log in as, so
+// it is on by default. Operators who have already created their own accounts
+// turn it off — see TestLoad_BootstrapCanBeDisabled.
+func TestLoad_Bootstrap_DefaultsEnabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.Bootstrap.Enabled, "bootstrap.enabled must default to true")
+	assert.Equal(t, "admin", cfg.Bootstrap.AdminUsername)
+}
+
+// bootstrap.enabled=false is the supported way to drop the admin credentials
+// from the config file: the block can then be omitted entirely without the
+// shipped admin123 default coming back (#243).
+func TestLoad_BootstrapCanBeDisabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n" +
+		"bootstrap:\n  enabled: false\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Bootstrap.Enabled)
+}
+
+// The Kubernetes path sets configuration through the environment, so the
+// disable switch has to work there too.
+func TestLoad_BootstrapDisabledViaEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	t.Setenv("NEXSPENCE_BOOTSTRAP_ENABLED", "false")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Bootstrap.Enabled)
+}
+
+// Nexspence ships no scanner binary, so a product must not claim to offer
+// what it does not deliver: scan.trivy.enabled defaults to false even though
+// scan.enabled itself defaults to true.
+func TestLoad_TrivyDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Scan.Trivy.Enabled,
+		"scan.trivy.enabled must default to false — the product must not promise a scanner it does not ship")
+	assert.Equal(t, "trivy", cfg.Scan.Trivy.Bin)
+	assert.Empty(t, cfg.Scan.Trivy.DBRepository,
+		"scan.trivy.db_repository must default to empty (means: do not pass the flag)")
+	assert.Empty(t, cfg.Scan.Trivy.JavaDBRepository, "scan.trivy.java_db_repository must default to empty")
+	assert.False(t, cfg.Scan.Trivy.SkipDBUpdate, "scan.trivy.skip_db_update must default to false")
+	assert.Empty(t, cfg.Scan.Trivy.CacheDir, "scan.trivy.cache_dir must default to empty")
+}
+
+func TestLoad_TrivyFromEnv(t *testing.T) {
+	// Viper skips keys with no default when unmarshalling with AutomaticEnv,
+	// so this also guards the SetDefault calls that make these env vars
+	// resolvable.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	t.Setenv("NEXSPENCE_SCAN_TRIVY_ENABLED", "true")
+	t.Setenv("NEXSPENCE_SCAN_TRIVY_BIN", "/opt/trivy/trivy")
+	t.Setenv("NEXSPENCE_SCAN_TRIVY_SKIP_DB_UPDATE", "true")
+	t.Setenv("NEXSPENCE_SCAN_TRIVY_CACHE_DIR", "/var/cache/trivy")
+	// Confirmed empirically (and consistent with TestLoad_TrustedProxies_EnvOverride
+	// above): viper's default Unmarshal decode hooks split a comma-separated env
+	// value into a []string via mapstructure.StringToSliceHookFunc(","). A single
+	// value with no comma yields a one-element slice.
+	t.Setenv("NEXSPENCE_SCAN_TRIVY_DB_REPOSITORY", "mirror1.example.com/trivy-db,mirror2.example.com/trivy-db")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.Scan.Trivy.Enabled, "NEXSPENCE_SCAN_TRIVY_ENABLED was not applied")
+	assert.Equal(t, "/opt/trivy/trivy", cfg.Scan.Trivy.Bin)
+	assert.True(t, cfg.Scan.Trivy.SkipDBUpdate, "NEXSPENCE_SCAN_TRIVY_SKIP_DB_UPDATE was not applied")
+	assert.Equal(t, "/var/cache/trivy", cfg.Scan.Trivy.CacheDir)
+	assert.Equal(t, []string{"mirror1.example.com/trivy-db", "mirror2.example.com/trivy-db"}, cfg.Scan.Trivy.DBRepository,
+		"NEXSPENCE_SCAN_TRIVY_DB_REPOSITORY was not applied")
+}
+
+func TestLoad_RedisPasswordFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	t.Setenv("NEXSPENCE_REDIS_ENABLED", "true")
+	t.Setenv("NEXSPENCE_REDIS_ADDR", "nexspence-redis-primary:6379")
+	t.Setenv("NEXSPENCE_REDIS_PASSWORD", "s3cret")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.Redis.Enabled)
+	assert.Equal(t, "nexspence-redis-primary:6379", cfg.Redis.Addr)
+	assert.Equal(t, "s3cret", cfg.Redis.Password)
+}
+
+func TestLoad_AzureStorageFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	t.Setenv("NEXSPENCE_STORAGE_DEFAULT_TYPE", "azure")
+	t.Setenv("NEXSPENCE_STORAGE_AZURE_CONTAINER", "nexspence-blobs")
+	t.Setenv("NEXSPENCE_STORAGE_AZURE_ACCOUNT_NAME", "mystorage")
+	t.Setenv("NEXSPENCE_STORAGE_AZURE_ACCOUNT_KEY", "secret-key")
+	t.Setenv("NEXSPENCE_STORAGE_AZURE_ENDPOINT", "https://mystorage.blob.core.windows.net")
+	t.Setenv("NEXSPENCE_STORAGE_AZURE_SKIP_TLS_VERIFY", "true")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "azure", cfg.Storage.DefaultType)
+	assert.Equal(t, "nexspence-blobs", cfg.Storage.Azure.Container)
+	assert.Equal(t, "mystorage", cfg.Storage.Azure.AccountName)
+	assert.Equal(t, "secret-key", cfg.Storage.Azure.AccountKey)
+	assert.Equal(t, "https://mystorage.blob.core.windows.net", cfg.Storage.Azure.Endpoint)
+	assert.True(t, cfg.Storage.Azure.SkipTLSVerify)
+}
+
+func TestValidateStorage(t *testing.T) {
+	for _, tc := range []struct {
+		typ     string
+		wantErr bool
+	}{
+		{"", false},
+		{"local", false},
+		{"s3", false},
+		{"azure", false},
+		{"S3", true},
+		{"azue", true},
+		{"gcs", true},
+	} {
+		err := ValidateStorage(StorageConfig{DefaultType: tc.typ})
+		if tc.wantErr {
+			assert.Error(t, err, "default_type %q must be rejected, not silently treated as local", tc.typ)
+			continue
+		}
+		assert.NoError(t, err, "default_type %q must be accepted", tc.typ)
+	}
+}
+
+// Viper splits map keys on "." (its path delimiter). Alias hostnames always
+// contain dots, so without flattening Unmarshal into map[string]string fails
+// even when the YAML key is quoted — the split is after parse, not a YAML issue.
+func TestLoad_DockerSubdomainAliases_DottedHostnames(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n" +
+		"docker:\n" +
+		"  subdomain_connector:\n" +
+		"    enabled: true\n" +
+		"    base_domain: \"nexspence.example.com\"\n" +
+		"    aliases:\n" +
+		"      \"docker-hub-proxy.example.com\": \"dockerhub-proxy\"\n" +
+		"      hub.nexspence.example.com: dockerhub-proxy\n" +
+		"      docker-group.example.com: docker-group\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{
+		"docker-hub-proxy.example.com": "dockerhub-proxy",
+		"hub.nexspence.example.com":    "dockerhub-proxy",
+		"docker-group.example.com":     "docker-group",
+	}, cfg.Docker.SubdomainConnector.Aliases)
+}
+
+// Viper's env lookup treats an empty value as "unset" unless AllowEmptyEnv is
+// on, so NEXSPENCE_OIDC_GROUPS_CLAIM="" used to leave the non-empty default
+// ("groups") in place — the exact opposite of what an operator disabling the
+// claim asked for, with no error to say so (#482).
+func TestLoad_ExplicitEmptyEnvOverridesNonEmptyDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	t.Setenv("NEXSPENCE_OIDC_GROUPS_CLAIM", "")
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "", cfg.OIDC.GroupsClaim,
+		"an env var set to the empty string is an explicit override, not an absent one")
+}
+
+// The other direction must keep working: an env var that is not set at all
+// leaves the default alone.
+func TestLoad_UnsetEnvKeepsNonEmptyDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	require.NoError(t, os.Unsetenv("NEXSPENCE_OIDC_GROUPS_CLAIM"))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "groups", cfg.OIDC.GroupsClaim)
+}
+
+// ── oidc.google_admin_sdk (#483) ─────────────────────────────────────────────
+
+func TestValidateOIDC_GoogleAdminSDK_DisabledIgnoresFields(t *testing.T) {
+	c := validOIDC()
+	c.GoogleAdminSDK = GoogleAdminSDKConfig{Enabled: false}
+	require.NoError(t, ValidateOIDC(c))
+}
+
+func TestValidateOIDC_GoogleAdminSDK_RequiresSubject(t *testing.T) {
+	c := validOIDC()
+	c.GoogleAdminSDK = GoogleAdminSDKConfig{Enabled: true, ServiceAccountKey: `{"client_email":"x"}`}
+	err := ValidateOIDC(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "oidc.google_admin_sdk.subject_email")
+}
+
+func TestValidateOIDC_GoogleAdminSDK_RequiresKeyOrKeyFile(t *testing.T) {
+	c := validOIDC()
+	c.GoogleAdminSDK = GoogleAdminSDKConfig{Enabled: true, SubjectEmail: "admin@company.com"}
+	err := ValidateOIDC(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "service_account_key")
+}
+
+func TestValidateOIDC_GoogleAdminSDK_KeyFileIsEnough(t *testing.T) {
+	c := validOIDC()
+	c.GoogleAdminSDK = GoogleAdminSDKConfig{Enabled: true, SubjectEmail: "admin@company.com", ServiceAccountKeyFile: "/run/secrets/key.json"}
+	require.NoError(t, ValidateOIDC(c))
+}
+
+func TestLoad_GoogleAdminSDK_FromEnv(t *testing.T) {
+	t.Setenv("NEXSPENCE_OIDC_GOOGLE_ADMIN_SDK_ENABLED", "true")
+	t.Setenv("NEXSPENCE_OIDC_GOOGLE_ADMIN_SDK_SUBJECT_EMAIL", "admin@company.com")
+	t.Setenv("NEXSPENCE_OIDC_GOOGLE_ADMIN_SDK_SERVICE_ACCOUNT_KEY", `{"client_email":"sa@p.iam.gserviceaccount.com"}`)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(""+
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n"+
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"), 0o600))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.OIDC.GoogleAdminSDK.Enabled)
+	assert.Equal(t, "admin@company.com", cfg.OIDC.GoogleAdminSDK.SubjectEmail)
+	assert.Contains(t, cfg.OIDC.GoogleAdminSDK.ServiceAccountKey, "sa@p.iam")
+}
+
+// The pool default is per instance and replicas multiply it, so it stays well
+// under PostgreSQL's default max_connections (#639). Defaults are not
+// "explicitly set": pool sizing may clamp them.
+func TestLoad_PoolDefaultsAreNotExplicit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 20, cfg.Database.MaxConns)
+	assert.Equal(t, 5, cfg.Database.MinConns)
+	assert.False(t, cfg.Database.MaxConnsSet)
+	assert.False(t, cfg.Database.MinConnsSet)
+}
+
+// A value from the config file or the environment is the operator's choice.
+func TestLoad_PoolSettingsFromFileOrEnvAreExplicit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n  max_conns: 40\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	t.Setenv("NEXSPENCE_DATABASE_MIN_CONNS", "8")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 40, cfg.Database.MaxConns)
+	assert.Equal(t, 8, cfg.Database.MinConns)
+	assert.True(t, cfg.Database.MaxConnsSet, "from the config file")
+	assert.True(t, cfg.Database.MinConnsSet, "from the environment")
+}
+
+// A key spelled the way the Helm chart's values.yaml spells it, and the env
+// name derived from that spelling, both match nothing: viper drops them, and
+// the subdomain connector stayed off while the config said enabled (#660).
+// Load names them, with the key that was meant.
+func TestLoad_ReportsUnknownKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n" +
+		"docker:\n  max_upload_bytes: 10\n  subdomainConnector:\n    enabled: true\n    base_domain: registry.example.com\n" +
+		"nosuchsection:\n  x: 1\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	t.Setenv("NEXSPENCE_DOCKER_SUBDOMAINCONNECTOR_ENABLED", "true")
+	t.Setenv("NEXSPENCE_NOT_A_SETTING", "1")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Docker.SubdomainConnector.Enabled)
+	assert.ElementsMatch(t, []string{
+		`config key "docker.subdomainconnector" is not a setting and is ignored (did you mean "docker.subdomain_connector"?)`,
+		`config key "nosuchsection" is not a setting and is ignored`,
+		`environment variable NEXSPENCE_DOCKER_SUBDOMAINCONNECTOR_ENABLED matches no setting and is ignored (did you mean NEXSPENCE_DOCKER_SUBDOMAIN_CONNECTOR_ENABLED?)`,
+		`environment variable NEXSPENCE_NOT_A_SETTING matches no setting and is ignored`,
+	}, cfg.UnknownKeys)
+}
+
+// Correct spellings report nothing: nested keys, a map setting with dotted
+// hostname keys, and env names of leaves and of keys under a map.
+func TestLoad_KnownKeysAreNotReported(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n" +
+		"docker:\n  subdomain_connector:\n    enabled: true\n    aliases:\n      docker.registry.example.com: docker-group\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	t.Setenv("NEXSPENCE_DOCKER_SUBDOMAIN_CONNECTOR_BASE_DOMAIN", "registry.example.com")
+	t.Setenv("NEXSPENCE_DATABASE_MAX_CONNS", "10")
+	t.Setenv("NEXSPENCE_JWT_SECRET_FILE", "/app/secrets/jwt_secret") // the entrypoint's
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Empty(t, cfg.UnknownKeys)
+	assert.Equal(t, "docker-group", cfg.Docker.SubdomainConnector.Aliases["docker.registry.example.com"])
+}
+
+// The shipped example config uses only real keys.
+func TestLoad_ExampleConfigHasNoUnknownKeys(t *testing.T) {
+	t.Setenv("NEXSPENCE_AUTH_JWT_SECRET", "a-unique-production-secret-at-least-32b")
+	cfg, err := Load(filepath.Join("..", "..", "config.yaml.example"))
+	require.NoError(t, err)
+	assert.Empty(t, cfg.UnknownKeys)
+}

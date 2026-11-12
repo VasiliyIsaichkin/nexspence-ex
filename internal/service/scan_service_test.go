@@ -1,0 +1,480 @@
+package service_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/service"
+	"github.com/nexspence-oss/nexspence/internal/testutil"
+)
+
+func newDockerComp(repo, name, version string) *domain.Component {
+	return &domain.Component{
+		ID:         "comp-scan-1",
+		Repository: repo,
+		Format:     "docker",
+		Name:       name,
+		Version:    version,
+	}
+}
+
+func TestDockerScanImageRef(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		base, repo, name, ver, want string
+	}{
+		{
+			"http://localhost:8081",
+			"docker-hosted",
+			"da/devops/nginx",
+			"1.27.0",
+			"localhost:8081/repository/docker-hosted/da/devops/nginx:1.27.0",
+		},
+		{
+			"http://example.com/nexus",
+			"r1",
+			"library/alpine",
+			"latest",
+			"example.com/nexus/repository/r1/library/alpine:latest",
+		},
+	}
+	for _, tc := range cases {
+		got := service.DockerScanImageRef(tc.base, tc.repo, tc.name, tc.ver)
+		if got != tc.want {
+			t.Errorf("DockerScanImageRef(%q,%q,%q,%q) = %q, want %q", tc.base, tc.repo, tc.name, tc.ver, got, tc.want)
+		}
+	}
+}
+
+func TestScanService_NonDocker(t *testing.T) {
+	comp := &domain.Component{ID: "x", Format: "conan", Name: "openssl", Version: "3.0.0"}
+	comps := testutil.NewComponentRepo()
+	comps.Create(context.Background(), comp)
+
+	svc := service.NewScanService(comps, "")
+	_, err := svc.Scan(context.Background(), comp.ID, "")
+	if err == nil {
+		t.Fatal("expected error for non-docker format")
+	}
+	if !strings.Contains(err.Error(), "not supported for format") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestScanService_ComponentNotFound(t *testing.T) {
+	svc := service.NewScanService(testutil.NewComponentRepo(), "")
+	_, err := svc.Scan(context.Background(), "no-such-id", "alpine:latest")
+	if err == nil {
+		t.Fatal("expected error for missing component")
+	}
+}
+
+func TestScanService_TrivyNotInstalled(t *testing.T) {
+	comp := newDockerComp("dockerhosted", "alpine", "latest")
+	comps := testutil.NewComponentRepo()
+	comps.Create(context.Background(), comp)
+
+	svc := service.NewScanService(comps, "")
+	svc = svc.WithTrivy(service.TrivyOptions{Enabled: true, Bin: "/no/such/binary"})
+
+	_, err := svc.Scan(context.Background(), comp.ID, "alpine:latest")
+	var unavailable *service.ScannerUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("expected *ScannerUnavailableError, got %v", err)
+	}
+	if unavailable.Status.State != service.ScannerMissing {
+		t.Fatalf("State = %q, want %q", unavailable.Status.State, service.ScannerMissing)
+	}
+}
+
+// A flag-shaped imageRef ("--format=table") must be rejected before Trivy is
+// ever invoked: passed through, Trivy would parse it as an option and report
+// "scanned, no vulnerabilities" for an image it never looked at.
+func TestScanService_Scan_RejectsFlagShapedImageRef(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "trivy")
+	callLog := filepath.Join(dir, "calls.log")
+	script := "#!/bin/sh\necho \"$@\" >> " + callLog + "\necho 'Version: 0.99.0'\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	comp := newDockerComp("dockerhosted", "alpine", "latest")
+	comps := testutil.NewComponentRepo()
+	comps.Create(context.Background(), comp)
+
+	svc := service.NewScanService(comps, "http://localhost:8081").
+		WithTrivy(service.TrivyOptions{Enabled: true, Bin: bin})
+
+	_, err := svc.Scan(context.Background(), comp.ID, "--format=table")
+	if err == nil {
+		t.Fatal("a flag-shaped imageRef must be rejected, got a successful scan")
+	}
+	if !strings.Contains(err.Error(), `must not start with "-"`) {
+		t.Errorf("error = %q, want it to say the reference must not start with \"-\"", err)
+	}
+
+	calls, _ := os.ReadFile(callLog)
+	for _, line := range strings.Split(string(calls), "\n") {
+		if strings.HasPrefix(line, "image ") {
+			t.Errorf("trivy was invoked for the scan anyway: %q", line)
+		}
+	}
+}
+
+// An oci repository holds the same content a docker one does, so its components
+// must reach the Trivy path rather than being refused on their format label.
+func TestScanService_OCIFormat_ReachesTrivy(t *testing.T) {
+	comp := &domain.Component{
+		ID:         "comp-scan-oci",
+		Repository: "oci-hosted",
+		Format:     "oci",
+		Name:       "charts/nginx",
+		Version:    "1.2.3",
+	}
+	comps := testutil.NewComponentRepo()
+	comps.Create(context.Background(), comp)
+
+	svc := service.NewScanService(comps, "")
+	svc = svc.WithTrivy(service.TrivyOptions{Enabled: true, Bin: "/no/such/binary"})
+
+	_, err := svc.Scan(context.Background(), comp.ID, "")
+	var unavailable *service.ScannerUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("an oci component must reach the Trivy path, got %v", err)
+	}
+	if unavailable.Status.State != service.ScannerMissing {
+		t.Fatalf("State = %q, want %q", unavailable.Status.State, service.ScannerMissing)
+	}
+}
+
+func TestScanService_ParseTrivyJSON(t *testing.T) {
+	// Inject a fake "trivy" that echoes a minimal JSON report.
+	trivyOutput := `{
+		"SchemaVersion": 2,
+		"Results": [{
+			"Target": "alpine:3.15",
+			"Vulnerabilities": [
+				{"VulnerabilityID":"CVE-2022-1234","PkgName":"busybox","InstalledVersion":"1.34.0","FixedVersion":"1.34.1","Severity":"HIGH","Title":"rce"},
+				{"VulnerabilityID":"CVE-2022-5678","PkgName":"ssl","InstalledVersion":"1.1.1","Severity":"CRITICAL","Title":"overflow"}
+			]
+		}]
+	}`
+
+	findings, summary := exportParseTrivyJSON([]byte(trivyOutput))
+	if len(findings) != 2 {
+		t.Fatalf("expected 2 findings, got %d", len(findings))
+	}
+	if summary.High != 1 || summary.Critical != 1 || summary.Total != 2 {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+}
+
+func TestScanService_GetResult_Empty(t *testing.T) {
+	comp := newDockerComp("dockerhosted", "myimage", "v1")
+	comps := testutil.NewComponentRepo()
+	comps.Create(context.Background(), comp)
+
+	svc := service.NewScanService(comps, "")
+	result, err := svc.GetResult(context.Background(), comp.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Fatal("expected nil result for unscan component")
+	}
+}
+
+func TestScanService_GetResult_AfterPersist(t *testing.T) {
+	comp := newDockerComp("dockerhosted", "myimage", "v1")
+	comps := testutil.NewComponentRepo()
+	comps.Create(context.Background(), comp)
+
+	sr := &domain.ScanResult{
+		ImageRef: "myimage:v1",
+		Status:   domain.ScanStatusOK,
+		Summary:  domain.ScanSummary{High: 2, Total: 2},
+	}
+	b, _ := json.Marshal(sr)
+	var raw map[string]any
+	json.Unmarshal(b, &raw)
+	comps.UpdateExtra(context.Background(), comp.ID, map[string]any{"scan_result": raw})
+
+	svc := service.NewScanService(comps, "")
+	got, err := svc.GetResult(context.Background(), comp.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if got.Summary.High != 2 {
+		t.Fatalf("expected High=2, got %d", got.Summary.High)
+	}
+}
+
+// exportParseTrivyJSON is a test shim — it calls the unexported parseTrivyJSON
+// via the service package's test-visible wrapper.
+func exportParseTrivyJSON(data []byte) ([]domain.CVEFinding, domain.ScanSummary) {
+	return service.ParseTrivyJSONForTest(data)
+}
+
+// Scan must refuse before doing any work when the operator has not enabled
+// image scanning, and say so through the same status the probe reports.
+func TestScan_RefusesWhenDisabled(t *testing.T) {
+	comp := newDockerComp("docker-hosted", "alpine", "latest")
+	comps := testutil.NewComponentRepo()
+	comps.Create(context.Background(), comp)
+
+	svc := service.NewScanService(comps, "http://localhost:8081").
+		WithTrivy(service.TrivyOptions{Enabled: false})
+
+	_, err := svc.Scan(context.Background(), comp.ID, "")
+	var unavailable *service.ScannerUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("err = %v, want *ScannerUnavailableError", err)
+	}
+	if unavailable.Status.State != service.ScannerDisabled {
+		t.Errorf("State = %q, want %q", unavailable.Status.State, service.ScannerDisabled)
+	}
+}
+
+func TestScan_RefusesWhenBinaryMissing(t *testing.T) {
+	comp := newDockerComp("docker-hosted", "alpine", "latest")
+	comps := testutil.NewComponentRepo()
+	comps.Create(context.Background(), comp)
+
+	svc := service.NewScanService(comps, "http://localhost:8081").
+		WithTrivy(service.TrivyOptions{Enabled: true, Bin: "/nonexistent/trivy"})
+
+	_, err := svc.Scan(context.Background(), comp.ID, "")
+	var unavailable *service.ScannerUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("err = %v, want *ScannerUnavailableError", err)
+	}
+	if unavailable.Status.State != service.ScannerMissing {
+		t.Errorf("State = %q, want %q", unavailable.Status.State, service.ScannerMissing)
+	}
+}
+
+// A binary that probes fine but fails the scan itself must come back as a
+// failed scan result carrying the stderr-derived message — not a hard error.
+func TestScan_FailedRunRecordsTheStderrMessage(t *testing.T) {
+	if os.Getenv("CI") != "" {
+		t.Skip("skip fake-trivy shell script test in CI (no /bin/sh guarantee)")
+	}
+	comp := newDockerComp("docker-hosted", "alpine", "latest")
+	comps := testutil.NewComponentRepo()
+	comps.Create(context.Background(), comp)
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "trivy")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'Version: 0.70.0'; exit 0; fi\n" +
+		"echo 'MANIFEST_UNKNOWN: manifest unknown' >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake trivy: %v", err)
+	}
+
+	svc := service.NewScanService(comps, "http://localhost:8081").
+		WithTrivy(service.TrivyOptions{Enabled: true, Bin: bin})
+
+	result, err := svc.Scan(context.Background(), comp.ID, "")
+	if err != nil {
+		t.Fatalf("a failed run must be a result, not an error: %v", err)
+	}
+	if result.Status != domain.ScanStatusFailed {
+		t.Errorf("Status = %q, want %q", result.Status, domain.ScanStatusFailed)
+	}
+	if !strings.Contains(result.Error, "image manifest not found") {
+		t.Errorf("Error = %q, want the stderr-derived MANIFEST_UNKNOWN mapping", result.Error)
+	}
+}
+
+// The scanner switch governs image scanning only: OSV-backed formats must not
+// be refused when Trivy is disabled — they never needed it.
+func TestScan_OSVFormatsIgnoreTheScannerSwitch(t *testing.T) {
+	comp := &domain.Component{
+		ID: "comp-scan-npm", Repository: "npm-hosted", Format: "npm", Name: "lodash", Version: "4.17.21",
+	}
+	comps := testutil.NewComponentRepo()
+	comps.Create(context.Background(), comp)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"vulns": []any{}})
+	}))
+	defer srv.Close()
+
+	svc := service.NewScanService(comps, "http://localhost:8081").
+		WithTrivy(service.TrivyOptions{Enabled: false})
+	svc.OSVClient.BaseURL = srv.URL
+
+	result, err := svc.Scan(context.Background(), comp.ID, "")
+	var unavailable *service.ScannerUnavailableError
+	if errors.As(err, &unavailable) {
+		t.Fatalf("an npm scan must not be refused by the image-scanner switch, got %v", err)
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != domain.ScanStatusOK {
+		t.Errorf("Status = %q, want %q", result.Status, domain.ScanStatusOK)
+	}
+}
+
+func TestScanService_WithScanResults_InsertsCalled(t *testing.T) {
+	t.Parallel()
+	comp := &domain.Component{
+		Repository: "npmhosted",
+		Format:     "npm",
+		Name:       "lodash",
+		Version:    "4.17.20",
+	}
+	comps := testutil.NewComponentRepo()
+	comps.Create(context.Background(), comp)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"vulns": []map[string]any{
+				{"id": "CVE-2021-9999", "aliases": []string{"CVE-2021-9999"}, "summary": "Prototype pollution",
+					"database_specific": map[string]any{"severity": "HIGH"}},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	scanRepo := testutil.NewScanResultRepo()
+	svc := service.NewScanService(comps, "")
+	svc.WithScanResults(scanRepo)
+	svc.OSVClient.BaseURL = srv.URL
+
+	result, err := svc.Scan(context.Background(), comp.ID, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Summary.High != 1 {
+		t.Errorf("expected High=1, got %d", result.Summary.High)
+	}
+
+	rows := scanRepo.Rows()
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 scan_results row, got %d", len(rows))
+	}
+	if rows[0].High != 1 {
+		t.Errorf("expected row.High=1, got %d", rows[0].High)
+	}
+	if rows[0].Scanner != "osv" {
+		t.Errorf("expected scanner=osv, got %q", rows[0].Scanner)
+	}
+}
+
+func TestScanService_BulkScan(t *testing.T) {
+	t.Parallel()
+	comps := testutil.NewComponentRepo()
+	comps.Create(context.Background(), &domain.Component{
+		Repository: "npm-repo", Format: "npm", Name: "pkg-a", Version: "1.0.0",
+	})
+	comps.Create(context.Background(), &domain.Component{
+		Repository: "npm-repo", Format: "npm", Name: "pkg-b", Version: "2.0.0",
+	})
+	comps.Create(context.Background(), &domain.Component{
+		Repository: "raw-repo", Format: "raw", Name: "somefile", Version: "",
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"vulns": []any{}})
+	}))
+	defer srv.Close()
+
+	scanRepo := testutil.NewScanResultRepo()
+	svc := service.NewScanService(comps, "")
+	svc.WithScanResults(scanRepo)
+	svc.OSVClient.BaseURL = srv.URL
+
+	scanned, failed, err := svc.BulkScan(context.Background(), "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if scanned != 2 {
+		t.Errorf("expected scanned=2, got %d", scanned)
+	}
+	if failed != 1 {
+		t.Errorf("expected failed=1, got %d", failed)
+	}
+}
+
+// BulkScan is the safety net for whatever the auto-scan queue drops, so it must
+// walk the whole repository. The repository layer hands out at most 500 rows per
+// Search call — a repository above that size is only covered if BulkScan pages
+// through with the continuation token instead of trusting one oversized Limit.
+func TestScanService_BulkScan_PagesThroughLargeRepository(t *testing.T) {
+	t.Parallel()
+	const total = 520
+	comps := testutil.NewComponentRepo()
+	for i := 0; i < total; i++ {
+		comps.Create(context.Background(), &domain.Component{
+			Repository: "npm-big", Format: "npm",
+			Name: fmt.Sprintf("pkg-%03d", i), Version: "1.0.0",
+		})
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"vulns": []any{}})
+	}))
+	defer srv.Close()
+
+	svc := service.NewScanService(comps, "")
+	svc.WithScanResults(testutil.NewScanResultRepo())
+	svc.OSVClient.BaseURL = srv.URL
+
+	scanned, failed, err := svc.BulkScan(context.Background(), "npm-big")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if scanned != total {
+		t.Errorf("scanned = %d, want %d — components beyond the first page were never attempted", scanned, total)
+	}
+	if failed != 0 {
+		t.Errorf("failed = %d, want 0", failed)
+	}
+}
+
+func TestScanService_GetSummary(t *testing.T) {
+	t.Parallel()
+	scanRepo := testutil.NewScanResultRepo()
+	scanRepo.Insert(context.Background(), &domain.ScanResultRow{
+		ComponentID: "c1", Scanner: "osv", Status: domain.ScanStatusOK,
+		Critical: 2, High: 1, Total: 3,
+	})
+	scanRepo.Insert(context.Background(), &domain.ScanResultRow{
+		ComponentID: "c2", Scanner: "osv", Status: domain.ScanStatusOK,
+		High: 3, Total: 3,
+	})
+
+	svc := service.NewScanService(testutil.NewComponentRepo(), "")
+	svc.WithScanResults(scanRepo)
+
+	summary, err := svc.GetSummary(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if summary.Critical != 2 {
+		t.Errorf("expected Critical=2, got %d", summary.Critical)
+	}
+	if summary.High != 4 {
+		t.Errorf("expected High=4, got %d", summary.High)
+	}
+	if summary.ScannedTotal != 2 {
+		t.Errorf("expected ScannedTotal=2, got %d", summary.ScannedTotal)
+	}
+}

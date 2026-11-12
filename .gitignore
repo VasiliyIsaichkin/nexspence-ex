@@ -1,0 +1,79 @@
+# Worktrees
+.worktrees/
+
+# Binary
+bin/
+/server
+*.exe
+
+# Config with secrets (use config.yaml.example as template)
+config.yaml
+config.local.yaml
+.env
+.env.local
+
+# Data
+data/
+*.tmp
+
+# Go
+vendor/
+*.test
+coverage.out
+coverage.html
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docker
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+
+# AI tools
+.superpowers/
+
+#LLM
+AGENTS.md
+CLAUDE.md
+bugs.md
+findings.md
+progress.md
+task_plan.md
+.qwen/
+.claude/
+.cursor/
+
+# AI session artifacts
+docs/superpowers/brainstorm/
+docs/superpowers/plans/
+docs/superpowers/specs/
+graphify-out
+
+# Monitoring — API token
+deploy/monitoring/prometheus-token
+
+# Build archives
+website.zip
+*.zip
+
+# GoReleaser output
+dist/
+
+# Release-workflow scratch (written before GoReleaser runs; must not dirty the tree)
+release-assets/
+release-bundle/
+.cache/
+
+
+# Local security audit notes — never publish
+SECURITY-AUDIT-*.md

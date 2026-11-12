@@ -1,0 +1,412 @@
+/**
+ * Holographic Depth — design tokens for self_nexus.
+ *
+ * Drop into frontend/src/components/holo/, then:
+ *   import './components/holo/holo.css'
+ *
+ * Then wrap the root layout in <div className="holo-app">…</div>
+ * to get the holographic background and base typography.
+ */
+
+
+:root {
+  /* Palette */
+  --holo-bg:        #080612;
+  --holo-bg-2:      rgba(255,255,255,0.025);
+  --holo-bg-3:      rgba(255,255,255,0.05);
+  --holo-text:      #f4f0ff;
+  --holo-text-dim:  rgba(244,240,255,0.55);
+  --holo-text-faint:rgba(244,240,255,0.30);
+
+  --holo-a:         #7c5cff;       /* purple */
+  --holo-b:         #22d3ee;       /* cyan */
+  --holo-c:         #ff5cf0;       /* magenta */
+  --holo-green:     #5effb8;
+  --holo-amber:     #ffc857;
+  --holo-red:       #ff6b6b;
+
+  --holo-border:        rgba(124,92,255,0.20);
+  --holo-border-strong: rgba(124,92,255,0.40);
+  --holo-radius:        14px;
+  --holo-radius-sm:     10px;
+  --holo-radius-pill:   999px;
+
+  --holo-ring: 0 0 0 3px rgba(124,92,255,0.30);
+
+  --holo-gradient: linear-gradient(110deg, #7c5cff 0%, #22d3ee 35%, #ff5cf0 70%, #7c5cff 100%);
+
+  /* Primary action fill.
+     Deliberately not --holo-gradient: that one runs through cyan and magenta,
+     which puts white label text at roughly 2:1 and, animated on every primary
+     button at once, makes the page restless. These two stops stay in the brand
+     purple and hold >=4.6:1 across the whole face of the button. If you lighten
+     them, re-check that first. */
+  --holo-primary:       linear-gradient(180deg, #7554f0, #5a37d6);
+  --holo-primary-hover: linear-gradient(180deg, #7a5af2, #6440dd);
+}
+
+@keyframes holoShift {
+  0%, 100% { background-position: 0% 50%; }
+  50%      { background-position: 100% 50%; }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* App shell — holographic background */
+.holo-app {
+  position: relative;
+  min-height: 100vh;
+  background: var(--holo-bg);
+  color: var(--holo-text);
+  font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+  overflow: hidden;
+}
+.holo-app::before {
+  content: '';
+  position: fixed; inset: 0; pointer-events: none; z-index: 0;
+  background:
+    radial-gradient(circle at 20% 30%, rgba(124,92,255,0.30), transparent 60%),
+    radial-gradient(circle at 80% 70%, rgba(34,211,238,0.18),  transparent 60%),
+    radial-gradient(circle at 60% 50%, rgba(255,92,240,0.14),  transparent 60%);
+  filter: blur(40px);
+}
+.holo-app::after {
+  content: '';
+  position: fixed; inset: 0; pointer-events: none; z-index: 1;
+  background: repeating-linear-gradient(
+    0deg, transparent, transparent 2px,
+    rgba(var(--holo-ink-rgb), 0.012) 2px, rgba(var(--holo-ink-rgb), 0.012) 3px
+  );
+}
+.holo-app > * { position: relative; z-index: 2; }
+
+/* Holographic gradient text — apply with class */
+.holo-text {
+  background: var(--holo-gradient);
+  background-size: 200% 200%;
+  -webkit-background-clip: text;
+          background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: holoShift 5s ease infinite;
+}
+
+/* Glass surface — generic card */
+.holo-card {
+  background: var(--holo-bg-2);
+  border: 1px solid rgba(var(--holo-ink-rgb), 0.06);
+  border-radius: var(--holo-radius);
+  backdrop-filter: blur(20px);
+  position: relative;
+  overflow: hidden;
+  padding: 16px;
+}
+.holo-card--accent {
+  background: linear-gradient(135deg, rgba(124,92,255,0.18), rgba(34,211,238,0.08), rgba(255,92,240,0.10));
+  border-color: var(--holo-border);
+}
+.holo-card__edge {
+  position: absolute; top: 0; left: 0; right: 0; height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(124,92,255,0.7), rgba(34,211,238,0.7), rgba(255,92,240,0.7), transparent);
+  opacity: 0.5;
+}
+
+/* Sidebar */
+.holo-sidebar {
+  width: 220px; padding: 16px;
+  background: var(--holo-surface-sidebar);
+  backdrop-filter: blur(30px);
+  border-right: 1px solid rgba(124,92,255,0.15);
+  display: flex; flex-direction: column; gap: 4px;
+}
+.holo-nav {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 11px; border-radius: 9px;
+  font-size: 13px; color: var(--holo-text-dim);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition:
+    background   0.15s ease-out,
+    color        0.15s ease-out,
+    border-color 0.15s ease-out,
+    transform    0.12s cubic-bezier(0.23, 1, 0.32, 1);
+}
+@media (hover: hover) and (pointer: fine) {
+  .holo-nav:not(.active):hover {
+    background: rgba(var(--holo-ink-rgb), 0.05);
+    color: var(--holo-text);
+    border-color: rgba(var(--holo-ink-rgb), 0.07);
+  }
+}
+.holo-nav:not(.active):active { transform: scale(0.98); transition-duration: 80ms; }
+.holo-nav.active {
+  background: linear-gradient(90deg, rgba(124,92,255,0.18), rgba(34,211,238,0.06));
+  border-color: var(--holo-border-strong);
+  color: var(--holo-text);
+}
+
+/* Buttons */
+.holo-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 16px; border-radius: var(--holo-radius-sm);
+  font: 600 13px/1.2 inherit; letter-spacing: -0.005em;
+  background: var(--holo-bg-3); color: var(--holo-text);
+  border: 1px solid rgba(var(--holo-ink-rgb), 0.10);
+  cursor: pointer;
+  transition:
+    background    0.15s ease-out,
+    border-color  0.15s ease-out,
+    box-shadow    0.18s ease-out,
+    transform     0.15s cubic-bezier(0.23, 1, 0.32, 1);
+}
+@media (hover: hover) and (pointer: fine) {
+  .holo-btn:not(:disabled):hover {
+    background: rgba(var(--holo-ink-rgb), 0.11);
+    border-color: rgba(var(--holo-ink-rgb), 0.22);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 14px var(--holo-shadow-28);
+  }
+}
+.holo-btn:not(:disabled):active {
+  transform: scale(0.97);
+  transition-duration: 80ms;
+}
+.holo-btn:focus-visible { outline: none; box-shadow: var(--holo-ring); }
+.holo-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* Solid brand fill. The holographic gradient stays where it reads as identity —
+   headings, the active tab rule, card hairlines — rather than on every action
+   button, where an always-animating fill and a permanent 30px glow competed
+   with the content for attention. */
+.holo-btn--primary {
+  color: #fff;
+  background: var(--holo-primary);
+  border-color: rgba(160,140,255,0.55);
+  box-shadow: 0 2px 10px rgba(124,92,255,0.20);
+}
+@media (hover: hover) and (pointer: fine) {
+  .holo-btn--primary:not(:disabled):hover {
+    background: var(--holo-primary-hover);
+    border-color: rgba(180,165,255,0.75);
+    transform: translateY(-1px);
+    box-shadow: 0 6px 20px rgba(124,92,255,0.30), 0 4px 14px var(--holo-shadow-20);
+  }
+}
+/* A gradient under opacity:0.45 turns to mud — the button stopped looking
+   disabled and started looking broken. Disabled drops the fill entirely. */
+.holo-btn--primary:disabled {
+  background: var(--holo-bg-3);
+  color: var(--holo-text-dim);
+  border-color: rgba(var(--holo-ink-rgb), 0.10);
+  box-shadow: none;
+  opacity: 1;
+}
+.holo-btn--danger {
+  color: var(--holo-red);
+  background: rgba(255,107,107,0.10);
+  border-color: rgba(255,107,107,0.30);
+}
+@media (hover: hover) and (pointer: fine) {
+  .holo-btn--danger:not(:disabled):hover {
+    background: rgba(255,107,107,0.18);
+    border-color: rgba(255,107,107,0.48);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 14px rgba(255,107,107,0.18);
+  }
+}
+
+/* Pills */
+.holo-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: var(--holo-radius-pill);
+  font: 500 11px/1.4 'Geist Mono', monospace;
+  background: var(--holo-bg-3); color: var(--holo-text-dim);
+  border: 1px solid rgba(var(--holo-ink-rgb), 0.08);
+}
+.holo-pill--success { color: var(--holo-green); background: rgba(94,255,184,0.12); border-color: rgba(94,255,184,0.30); }
+.holo-pill--warn    { color: var(--holo-amber); background: rgba(255,200,87,0.12); border-color: rgba(255,200,87,0.30); }
+.holo-pill--danger  { color: var(--holo-red);   background: rgba(255,107,107,0.12); border-color: rgba(255,107,107,0.30); }
+
+/* Inputs */
+.holo-input {
+  background: var(--holo-bg-3);
+  border: 1px solid rgba(var(--holo-ink-rgb), 0.10);
+  border-radius: var(--holo-radius-sm);
+  padding: 8px 12px;
+  color: var(--holo-text);
+  font: 400 13px/1.2 inherit;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.18s;
+}
+.holo-input:focus { border-color: var(--holo-border-strong); box-shadow: var(--holo-ring); }
+.holo-input::placeholder { color: var(--holo-text-faint); }
+
+/* Tabs */
+.holo-tabs { display: flex; gap: 0; border-bottom: 1px solid rgba(var(--holo-ink-rgb), 0.08); }
+.holo-tab {
+  position: relative;
+  padding: 10px 16px;
+  background: transparent; border: none;
+  font: 500 13px/1.2 inherit; color: var(--holo-text-dim);
+  cursor: pointer;
+  transition:
+    color     0.15s ease-out,
+    transform 0.12s cubic-bezier(0.23, 1, 0.32, 1);
+}
+@media (hover: hover) and (pointer: fine) {
+  .holo-tab:not(.active):hover { color: var(--holo-text); }
+}
+.holo-tab:not(.active):active { transform: scale(0.96); transition-duration: 80ms; }
+.holo-tab.active { color: var(--holo-text); font-weight: 600; }
+.holo-tab.active::after {
+  content: ''; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 2px;
+  background: var(--holo-gradient); background-size: 200% 200%;
+  animation: holoShift 5s ease infinite;
+  border-radius: 2px 2px 0 0;
+}
+.holo-tab:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--holo-c-blue);
+}
+
+/* Tables */
+.holo-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.holo-table thead th {
+  text-align: left; padding: 10px 12px;
+  font: 500 10.5px/1.4 'Geist Mono', monospace;
+  color: var(--holo-text-faint); text-transform: uppercase; letter-spacing: 0.06em;
+  border-bottom: 1px solid rgba(var(--holo-ink-rgb), 0.08);
+  background: none;
+}
+.holo-table tbody td { padding: 12px; border-bottom: 1px solid rgba(var(--holo-ink-rgb), 0.06); }
+.holo-table tbody tr { transition: background 0.15s; cursor: pointer; }
+.holo-table tbody tr:hover { background: rgba(124,92,255,0.05); }
+
+/* Modal */
+.holo-overlay {
+  position: fixed; inset: 0; z-index: 50;
+  background: var(--holo-scrim);
+  backdrop-filter: blur(8px);
+  display: grid; place-items: center;
+}
+.holo-modal {
+  background: linear-gradient(135deg, var(--holo-modal-from), var(--holo-modal-to));
+  border: 1px solid var(--holo-border);
+  border-radius: 18px;
+  padding: 24px;
+  min-width: min(420px, 95vw); max-width: 90vw; max-height: 85vh;
+  box-shadow: 0 20px 60px var(--holo-shadow-60);
+  display: flex; flex-direction: column; gap: 16px;
+  position: relative; overflow-y: auto;
+}
+.holo-modal::before {
+  content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+  background: var(--holo-gradient); background-size: 200% 200%;
+  animation: holoShift 5s ease infinite;
+}
+
+/* Utility */
+.holo-mono { font-family: 'Geist Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+.holo-section-label {
+  font: 500 11px/1.4 'Geist Mono', monospace;
+  color: var(--holo-text-dim);
+  letter-spacing: 0.1em; text-transform: uppercase;
+}
+
+/* ── Wizard ──────────────────────────────────────────────────────────── */
+.holo-wizard {
+  background: linear-gradient(135deg, var(--holo-wizard-from) 0%, var(--holo-wizard-to) 100%);
+  border: 1px solid var(--holo-border);
+  border-radius: 16px;
+  overflow: hidden;
+  min-width: min(560px, 95vw);
+  max-width: 90vw;
+  max-height: 85vh;
+  box-shadow: 0 24px 64px var(--holo-shadow-70), 0 0 0 1px rgba(124,92,255,0.08);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+.holo-wizard::before {
+  content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+  background: var(--holo-gradient); background-size: 200% 200%;
+  animation: holoShift 5s ease infinite; z-index: 1;
+}
+.holo-wizard__progress {
+  display: flex; align-items: center;
+  padding: 14px 20px;
+  background: var(--holo-well-35);
+  border-bottom: 1px solid rgba(124,92,255,0.12);
+}
+.holo-wizard__step-meta { display: flex; align-items: center; gap: 7px; }
+.holo-wizard__dot {
+  width: 24px; height: 24px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 700; flex-shrink: 0;
+  transition: all 0.2s ease;
+}
+.holo-wizard__dot--done   { background: var(--holo-c-blue); color: #fff; box-shadow: 0 0 10px rgba(59,130,246,0.4); }
+.holo-wizard__dot--active { background: rgba(59,130,246,0.2); border: 2px solid var(--holo-c-blue); color: var(--holo-c-blue-400); box-shadow: 0 0 12px rgba(59,130,246,0.3); }
+.holo-wizard__dot--pending { background: rgba(var(--holo-ink-rgb), 0.04); border: 1.5px solid rgba(var(--holo-ink-rgb), 0.1); color: var(--holo-c-slate-700); }
+.holo-wizard__step-text { display: flex; flex-direction: column; }
+.holo-wizard__step-num { font-size: 11px; color: var(--holo-c-slate-600); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.holo-wizard__step-name { font-size: 12px; font-weight: 600; }
+.holo-wizard__step-name--active  { color: var(--holo-c-blue-300); }
+.holo-wizard__step-name--done    { color: var(--holo-c-slate-500); }
+.holo-wizard__step-name--pending { color: var(--holo-c-slate-700); }
+.holo-wizard__line { flex: 1; height: 1.5px; margin: 0 8px; background: rgba(124,92,255,0.12); transition: background 0.3s; }
+.holo-wizard__line--done { background: rgba(59,130,246,0.4); }
+.holo-wizard__body { padding: 20px; min-height: 200px; overflow-y: auto; flex: 1; }
+@keyframes wizardSlideLeft  { from { transform: translateX(0); opacity: 1; } to { transform: translateX(-16px); opacity: 0; } }
+@keyframes wizardSlideRight { from { transform: translateX(0); opacity: 1; } to { transform: translateX( 16px); opacity: 0; } }
+.holo-wizard__body--left  { animation: wizardSlideLeft  0.2s ease-out forwards; }
+.holo-wizard__body--right { animation: wizardSlideRight 0.2s ease-out forwards; }
+.holo-wizard__error {
+  margin: 0 20px 4px;
+  background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.25);
+  border-radius: 8px; padding: 10px 12px; color: var(--holo-c-red-300); font-size: 13px;
+}
+.holo-wizard__footer {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 12px 20px; border-top: 1px solid rgba(124,92,255,0.1); background: var(--holo-well-15);
+}
+.holo-wizard__back { background: rgba(var(--holo-ink-rgb), 0.04); border: 1px solid rgba(var(--holo-ink-rgb), 0.08); color: var(--holo-text-dim); }
+.holo-wizard__step-info { font-size: 11px; color: var(--holo-c-slate-600); font-weight: 600; }
+
+/* Skeleton loaders */
+@keyframes skeletonPulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.8; }
+}
+.holo-skeleton {
+  background: rgba(59, 130, 246, 0.08);
+  border-radius: 6px;
+  animation: skeletonPulse 1.5s ease-in-out infinite;
+}
+.holo-skeleton--text {
+  height: 1em;
+  margin: 0.4em 0;
+}
+.holo-skeleton--block {
+  height: 80px;
+  width: 100%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .holo-text,
+  .holo-btn--primary,
+  .holo-tab.active::after,
+  .holo-modal::before,
+  .holo-wizard::before {
+    animation: none !important;
+    transition: none !important;
+  }
+  .holo-wizard__body--left,
+  .holo-wizard__body--right {
+    animation: none !important;
+    transition: none !important;
+  }
+  .holo-skeleton { animation: none; opacity: 0.5; }
+}

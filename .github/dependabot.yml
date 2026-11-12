@@ -1,0 +1,41 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: "/frontend"
+    schedule:
+      interval: weekly
+    groups:
+      # react and react-dom must always be on the exact same version —
+      # bumping one without the other breaks the whole test suite.
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+      # The typescript-eslint packages peer-depend on each other at an exact
+      # version. Bumping the plugin on its own leaves the parser behind and
+      # `npm ci` fails to resolve the tree, so they move as one.
+      typescript-eslint:
+        patterns:
+          - "typescript-eslint"
+          - "@typescript-eslint/*"
+      # @vitest/coverage-v8 peer-depends on vitest at the exact same version.
+      # Dependabot bumped the coverage provider to 5.0.0 on its own (#456) and
+      # `npm ci` failed with ERESOLVE, so the two move together.
+      vitest:
+        patterns:
+          - "vitest"
+          - "@vitest/*"
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

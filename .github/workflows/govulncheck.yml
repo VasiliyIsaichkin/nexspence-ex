@@ -1,0 +1,29 @@
+name: govulncheck
+
+on:
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.26.10'
+          cache: true
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      # The wrapper runs govulncheck and fails on every reported vulnerability
+      # except the ones in scripts/vulnerability-allowlist.txt, each with a
+      # written reason. It exists because the database still lists every
+      # version of crewjam/saml as affected by GO-2026-6909 although the
+      # defects are fixed from v0.6.0 on — a red gate on every pull request
+      # teaches everyone to ignore it.
+      - name: Run govulncheck (blocking)
+        run: python3 scripts/check-vulnerabilities.py

@@ -1,0 +1,312 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/repository"
+)
+
+type promotionRepo struct {
+	db *pgxpool.Pool
+}
+
+// NewPromotionRepo returns a postgres-backed PromotionRepo.
+func NewPromotionRepo(db *pgxpool.Pool) *promotionRepo {
+	return &promotionRepo{db: db}
+}
+
+const promotionRuleFields = `id, name, from_repo, to_repo, path_filter,
+	require_scan_pass, scan_fail_severities, require_manual_approval, auto_promote, created_at, updated_at`
+
+func scanPromotionRule(row pgx.Row) (*domain.PromotionRule, error) {
+	var r domain.PromotionRule
+	var pf *string
+	err := row.Scan(
+		&r.ID, &r.Name, &r.FromRepo, &r.ToRepo, &pf,
+		&r.RequireScanPass, &r.ScanFailSeverities, &r.RequireManualApproval, &r.AutoPromote, &r.CreatedAt, &r.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if pf != nil {
+		r.PathFilter = *pf
+	}
+	return &r, nil
+}
+
+// scanFailSeveritiesArg stores an empty list as NULL: both mean "the default
+// severities", and one spelling keeps the column honest about which rules chose
+// their own.
+func scanFailSeveritiesArg(rule *domain.PromotionRule) []string {
+	if len(rule.ScanFailSeverities) == 0 {
+		return nil
+	}
+	return rule.ScanFailSeverities
+}
+
+func (r *promotionRepo) ListRules(ctx context.Context) ([]domain.PromotionRule, error) {
+	rows, err := r.db.Query(ctx,
+		`SELECT `+promotionRuleFields+` FROM promotion_rules ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.PromotionRule
+	for rows.Next() {
+		rule, err := scanPromotionRule(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *rule)
+	}
+	return out, rows.Err()
+}
+
+func (r *promotionRepo) GetRule(ctx context.Context, id string) (*domain.PromotionRule, error) {
+	row := r.db.QueryRow(ctx,
+		`SELECT `+promotionRuleFields+` FROM promotion_rules WHERE id = $1`, id)
+	rule, err := scanPromotionRule(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, repository.ErrNotFound
+	}
+	return rule, err
+}
+
+func (r *promotionRepo) ListRulesByFromRepo(ctx context.Context, fromRepo string) ([]domain.PromotionRule, error) {
+	rows, err := r.db.Query(ctx,
+		`SELECT `+promotionRuleFields+` FROM promotion_rules WHERE from_repo = $1 ORDER BY name`, fromRepo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.PromotionRule
+	for rows.Next() {
+		rule, err := scanPromotionRule(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *rule)
+	}
+	return out, rows.Err()
+}
+
+func (r *promotionRepo) CreateRule(ctx context.Context, rule *domain.PromotionRule) error {
+	var pf *string
+	if rule.PathFilter != "" {
+		pf = &rule.PathFilter
+	}
+	return r.db.QueryRow(ctx,
+		`INSERT INTO promotion_rules
+		  (name, from_repo, to_repo, path_filter, require_scan_pass, require_manual_approval, scan_fail_severities, auto_promote)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		 RETURNING id, created_at, updated_at`,
+		rule.Name, rule.FromRepo, rule.ToRepo, pf,
+		rule.RequireScanPass, rule.RequireManualApproval, scanFailSeveritiesArg(rule), rule.AutoPromote,
+	).Scan(&rule.ID, &rule.CreatedAt, &rule.UpdatedAt)
+}
+
+func (r *promotionRepo) UpdateRule(ctx context.Context, rule *domain.PromotionRule) error {
+	var pf *string
+	if rule.PathFilter != "" {
+		pf = &rule.PathFilter
+	}
+	_, err := r.db.Exec(ctx,
+		`UPDATE promotion_rules
+		 SET name=$1, from_repo=$2, to_repo=$3, path_filter=$4,
+		     require_scan_pass=$5, require_manual_approval=$6, scan_fail_severities=$8, auto_promote=$9,
+		     updated_at=now()
+		 WHERE id=$7`,
+		rule.Name, rule.FromRepo, rule.ToRepo, pf,
+		rule.RequireScanPass, rule.RequireManualApproval, rule.ID, scanFailSeveritiesArg(rule), rule.AutoPromote,
+	)
+	return err
+}
+
+func (r *promotionRepo) DeleteRule(ctx context.Context, id string) error {
+	_, err := r.db.Exec(ctx, `DELETE FROM promotion_rules WHERE id=$1`, id)
+	return err
+}
+
+const promotionReqFields = `id, rule_id, component_id, status, requested_by, automatic, published_at,
+	reviewed_by, reviewed_at, completed_at, error, created_at`
+
+func scanPromotionRequest(row pgx.Row) (*domain.PromotionRequest, error) {
+	var req domain.PromotionRequest
+	var status string
+	var errMsg, requestedBy *string
+	err := row.Scan(
+		&req.ID, &req.RuleID, &req.ComponentID, &status, &requestedBy, &req.Automatic, &req.PublishedAt,
+		&req.ReviewedBy, &req.ReviewedAt, &req.CompletedAt, &errMsg, &req.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	req.Status = domain.PromotionStatus(status)
+	if requestedBy != nil {
+		req.RequestedBy = *requestedBy
+	}
+	if errMsg != nil {
+		req.Error = *errMsg
+	}
+	return &req, nil
+}
+
+func (r *promotionRepo) CreateRequest(ctx context.Context, req *domain.PromotionRequest) error {
+	return r.db.QueryRow(ctx,
+		`INSERT INTO promotion_requests (rule_id, component_id, status, requested_by)
+		 VALUES ($1,$2,$3,$4)
+		 RETURNING id, created_at`,
+		req.RuleID, req.ComponentID, string(req.Status), req.RequestedBy,
+	).Scan(&req.ID, &req.CreatedAt)
+}
+
+// CreateAutoRequest inserts an automatic request. The partial unique index
+// idx_promotion_requests_auto_pending admits one pending automatic request per
+// (rule, component); a second pending insert updates the first's published_at
+// (forward only) and reads it back instead.
+func (r *promotionRepo) CreateAutoRequest(ctx context.Context, req *domain.PromotionRequest) (bool, error) {
+	req.Automatic = true
+	req.RequestedBy = ""
+	var em *string
+	if req.Error != "" {
+		em = &req.Error
+	}
+	var inserted bool
+	err := r.db.QueryRow(ctx,
+		`INSERT INTO promotion_requests
+		   (rule_id, component_id, status, requested_by, automatic, completed_at, error, published_at)
+		 VALUES ($1,$2,$3,NULL,true,$4,$5,$6)
+		 ON CONFLICT (rule_id, component_id) WHERE automatic AND status = 'pending' DO UPDATE
+		 SET published_at = GREATEST(promotion_requests.published_at, EXCLUDED.published_at)
+		 RETURNING id, created_at, published_at, (xmax = 0)`,
+		req.RuleID, req.ComponentID, string(req.Status), req.CompletedAt, em, req.PublishedAt,
+	).Scan(&req.ID, &req.CreatedAt, &req.PublishedAt, &inserted)
+	if err != nil {
+		return false, err
+	}
+	if inserted {
+		return true, nil
+	}
+	existing, err := r.GetRequest(ctx, req.ID)
+	if err != nil {
+		return false, err
+	}
+	*req = *existing
+	return false, nil
+}
+
+// FailPendingAutoRequests settles the pending automatic request of the pair as
+// failed. A reviewer approving it at the same moment holds its row lock; the
+// UPDATE waits, re-reads the status and leaves a settled row alone.
+func (r *promotionRepo) FailPendingAutoRequests(ctx context.Context, ruleID, componentID, reason string) (int, error) {
+	tag, err := r.db.Exec(ctx,
+		`UPDATE promotion_requests SET status = 'failed', completed_at = now(), error = $3
+		 WHERE rule_id = $1 AND component_id = $2 AND automatic AND status = 'pending'`,
+		ruleID, componentID, reason)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+func (r *promotionRepo) GetRequest(ctx context.Context, id string) (*domain.PromotionRequest, error) {
+	row := r.db.QueryRow(ctx,
+		`SELECT `+promotionReqFields+` FROM promotion_requests WHERE id=$1`, id)
+	req, err := scanPromotionRequest(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, repository.ErrNotFound
+	}
+	return req, err
+}
+
+func (r *promotionRepo) ListRequests(ctx context.Context, status string) ([]domain.PromotionRequest, error) {
+	query := `SELECT ` + promotionReqFields + ` FROM promotion_requests`
+	args := []any{}
+	if status != "" {
+		query += ` WHERE status=$1`
+		args = append(args, status)
+	}
+	query += ` ORDER BY created_at DESC`
+	rows, err := r.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.PromotionRequest
+	for rows.Next() {
+		req, err := scanPromotionRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *req)
+	}
+	return out, rows.Err()
+}
+
+// WithPendingRequestLock serializes reviewers of one request with SELECT ...
+// FOR UPDATE: the second concurrent approver blocks on the row lock until the
+// first commits, then sees the non-pending status and never runs fn — so the
+// copy fn performs cannot execute twice for one request.
+func (r *promotionRepo) WithPendingRequestLock(ctx context.Context, id string,
+	fn func(ctx context.Context, req *domain.PromotionRequest) repository.PromotionOutcome,
+) error {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	row := tx.QueryRow(ctx,
+		`SELECT `+promotionReqFields+` FROM promotion_requests WHERE id=$1 FOR UPDATE`, id)
+	req, err := scanPromotionRequest(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return repository.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if req.Status != domain.PromotionPending {
+		return &repository.RequestNotPendingError{Status: string(req.Status)}
+	}
+
+	outcome := fn(ctx, req)
+	if outcome.Status == domain.PromotionPending {
+		return tx.Commit(ctx)
+	}
+	var em *string
+	if outcome.Error != "" {
+		em = &outcome.Error
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE promotion_requests
+		 SET status=$1, reviewed_by=$2, reviewed_at=$3, completed_at=$4, error=$5
+		 WHERE id=$6`,
+		string(outcome.Status), outcome.ReviewedBy, outcome.ReviewedAt, outcome.CompletedAt, em, id,
+	); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (r *promotionRepo) UpdateRequestStatus(
+	ctx context.Context, id string, status domain.PromotionStatus,
+	reviewedBy *string, reviewedAt, completedAt *time.Time, errMsg string,
+) error {
+	var em *string
+	if errMsg != "" {
+		em = &errMsg
+	}
+	_, err := r.db.Exec(ctx,
+		`UPDATE promotion_requests
+		 SET status=$1, reviewed_by=$2, reviewed_at=$3, completed_at=$4, error=$5
+		 WHERE id=$6`,
+		string(status), reviewedBy, reviewedAt, completedAt, em, id,
+	)
+	return err
+}

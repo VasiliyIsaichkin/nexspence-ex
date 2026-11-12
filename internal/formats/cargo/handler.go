@@ -1,0 +1,499 @@
+// Package cargo implements the Cargo (Rust) registry protocol.
+//
+// Cargo Alternate Registry API (RFC 2141):
+//
+//	GET  /api/v1/crates                      → search (JSON)
+//	GET  /api/v1/crates/:name/:version/download → download .crate
+//	PUT  /api/v1/crates/new                  → publish
+//	DELETE /api/v1/crates/:name/:version/yank → yank
+//	PUT  /api/v1/crates/:name/:version/unyank → unyank (not implemented)
+//
+// Index (sparse, RFC 3130):
+//
+//	GET  /index/config.json                  → {"dl":"...", "api":"..."}
+//	GET  /index/:prefix1/:prefix2/:name      → newline-delimited JSON records
+package cargo
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"path"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/formats"
+	"github.com/nexspence-oss/nexspence/internal/formats/base"
+	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
+)
+
+// Handler serves the Rust Cargo registry protocol.
+type Handler struct {
+	deps formats.Deps
+
+	// dlMu/dlBases cache each proxy repository's upstream download base — the
+	// "dl" value of the UPSTREAM's own /config.json. The real crates.io splits
+	// its API across hosts (sparse index on index.crates.io, downloads on
+	// crates.io), so the download endpoint cannot be derived from remote_url
+	// (#347). Cached per repo for the metadata TTL.
+	dlMu    sync.Mutex
+	dlBases map[string]dlBaseEntry
+
+	// age caches publish times for the minimum-package-age policy (#643);
+	// see age_filter.go.
+	age ageCache
+}
+
+type dlBaseEntry struct {
+	fetched time.Time
+	dl      string // empty = upstream has no usable config.json; fall back to remote_url
+	api     string // the upstream's "api" base; empty = none usable
+}
+
+// New creates a Cargo format Handler with the given dependencies.
+func New(deps formats.Deps) *Handler { return &Handler{deps: deps} }
+
+// Name returns the format identifier.
+func (h *Handler) Name() string { return "cargo" }
+
+func (h *Handler) ServeHTTP(c *gin.Context) {
+	p := normPath(c.Param("path"))
+	repoName := c.Param("repoName")
+
+	repo, _ := h.deps.Repos.Get(c.Request.Context(), repoName)
+
+	// Proxy: block mutations (publish/yank), proxy index and crate downloads
+	if repo != nil && repo.Type == domain.TypeProxy {
+		if repoproxy.RejectMutation(c, repo) {
+			return
+		}
+		// Sparse index config.json is always served locally (points to this server)
+		if c.Request.Method == http.MethodGet && p == "/index/config.json" {
+			h.serveIndexConfig(c, repoName)
+			return
+		}
+		// Sparse-index entries under /index/ are mutable metadata (they list a
+		// crate's versions); /api/v1/crates/.../download .crate files are immutable.
+		var maxAge time.Duration
+		if strings.HasPrefix(p, "/index/") {
+			maxAge = repoproxy.MetadataMaxAge(repo)
+		}
+		coords := proxyCoords(p)
+		// The local /index/ route prefix is not part of any real registry's
+		// URL scheme; downloads may live on a different host than the index —
+		// both resolved into an explicit upstreamPath (#347).
+		upstreamPath := ""
+		if strings.HasPrefix(p, "/index/") {
+			upstreamPath = repoproxy.CargoIndexUpstreamPath(p)
+		} else if name, version, ok := parseDownloadPath(p); ok {
+			if dl := h.upstreamDlBase(c.Request.Context(), repo); dl != "" {
+				upstreamPath = cargoDownloadURL(dl, name, version)
+				c.Request = c.Request.WithContext(repoproxy.WithTrustedAuthBases(c.Request.Context(), dl))
+			}
+		}
+		var rewrite func([]byte) []byte
+		if minAge := repoproxy.MinimumPackageAge(repo); minAge > 0 {
+			if done := h.applyAgePolicy(c, repo, p, minAge, &rewrite); done {
+				return
+			}
+		}
+		if err := repoproxy.ServeGETRewritten(c, h.deps, repo, p, upstreamPath, coords, "application/octet-stream", maxAge, rewrite); err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		}
+		return
+	}
+
+	switch {
+	// Sparse index config
+	case c.Request.Method == http.MethodGet && p == "/index/config.json":
+		h.serveIndexConfig(c, repoName)
+
+	// Sparse index entry: GET /index/:prefix1/:prefix2/:name
+	case c.Request.Method == http.MethodGet && strings.HasPrefix(p, "/index/"):
+		h.serveIndexEntry(c, repoName, p)
+
+	// Search: GET /api/v1/crates?q=name
+	case c.Request.Method == http.MethodGet && p == "/api/v1/crates":
+		h.handleSearch(c, repoName)
+
+	// Publish: PUT /api/v1/crates/new
+	case c.Request.Method == http.MethodPut && p == "/api/v1/crates/new":
+		h.handlePublish(c, repoName)
+
+	// Download: GET /api/v1/crates/:name/:version/download
+	case c.Request.Method == http.MethodGet && strings.HasSuffix(p, "/download"):
+		h.handleDownload(c, repoName, p)
+
+	// Yank: DELETE /api/v1/crates/:name/:version/yank
+	case c.Request.Method == http.MethodDelete && strings.HasSuffix(p, "/yank"):
+		h.handleYank(c, repoName, p)
+
+	default:
+		c.Status(http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) serveIndexConfig(c *gin.Context, repoName string) {
+	baseURL := h.deps.BaseURL + "/repository/" + repoName
+	c.JSON(http.StatusOK, gin.H{
+		"dl":            baseURL + "/api/v1/crates/{crate}/{version}/download",
+		"api":           baseURL,
+		"auth-required": h.indexAuthRequired(c.Request.Context(), repoName),
+	})
+}
+
+// indexAuthRequired reports whether an anonymous client is refused reads.
+// Cargo sends its token on index and download requests only when config.json
+// says auth-required: answering false for a private repository let cargo
+// read the index (it retries config.json with the token after a 401) and
+// then download every crate without one, into a 401 (#588). When the answer
+// cannot be worked out, the token is asked for: sending one to a public
+// repository is harmless.
+func (h *Handler) indexAuthRequired(ctx context.Context, repoName string) bool {
+	if h.deps.RBAC == nil {
+		return false
+	}
+	repo, err := h.deps.Repos.Get(ctx, repoName)
+	if err != nil || repo == nil {
+		return true
+	}
+	allowed, err := h.deps.RBAC.CanAccessRepo(ctx, "", nil, repo, "/", "read")
+	return err != nil || !allowed
+}
+
+func (h *Handler) serveIndexEntry(c *gin.Context, repoName, p string) {
+	// /index/:p1/:p2/:name  or  /index/:name  (for 1-2 char names)
+	parts := strings.Split(strings.TrimPrefix(p, "/index/"), "/")
+	if len(parts) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "invalid index path"})
+		return
+	}
+	crateName := parts[len(parts)-1]
+
+	// Every version of exactly this crate (names are lowercased on publish).
+	// Search matches substrings, where "_" is a wildcard too: it listed
+	// rvc-serde-json under rvc-serde, and a crate with enough versions whose
+	// name contained this one pushed it off the page entirely (#586).
+	comps, err := base.ExactComponents(c.Request.Context(), h.deps.Components, domain.SearchParams{
+		Repository: repoName, Name: strings.ToLower(crateName),
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if len(comps) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+
+	// Sparse index: newline-delimited JSON records
+	var sb strings.Builder
+	for _, comp := range comps {
+		asset, _ := h.deps.Assets.GetByPath(c.Request.Context(), repoName,
+			"/api/v1/crates/"+crateName+"/"+comp.Version+"/"+crateName+"-"+comp.Version+".crate")
+		checksum := ""
+		if asset != nil {
+			checksum = asset.SHA256
+		}
+		rec := map[string]any{
+			"name":     comp.Name,
+			"vers":     comp.Version,
+			"deps":     []any{},
+			"cksum":    checksum,
+			"features": map[string]any{},
+			"yanked":   false,
+		}
+		// Crates published before #587 carry no stored metadata and keep the
+		// empty deps and features until they are published again.
+		if deps, ok := comp.Extra[extraDeps]; ok && deps != nil {
+			rec["deps"] = deps
+		}
+		if feats, ok := comp.Extra[extraFeatures]; ok && feats != nil {
+			rec["features"] = feats
+		}
+		if feats2, ok := comp.Extra[extraFeatures2]; ok && feats2 != nil {
+			rec["features2"] = feats2
+			rec["v"] = 2
+		}
+		if links, ok := comp.Extra[extraLinks].(string); ok && links != "" {
+			rec["links"] = links
+		}
+		if rv, ok := comp.Extra[extraRustVersion].(string); ok && rv != "" {
+			rec["rust_version"] = rv
+		}
+		b, _ := json.Marshal(rec)
+		sb.Write(b)
+		sb.WriteByte('\n')
+	}
+	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(sb.String()))
+}
+
+func (h *Handler) handleSearch(c *gin.Context, repoName string) {
+	q := c.Query("q")
+	perPage := 10
+	page, err := h.deps.Components.Search(c.Request.Context(), domain.SearchParams{
+		Repository: repoName, Name: q, Limit: perPage,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	crates := make([]gin.H, 0, len(page.Items))
+	for _, comp := range page.Items {
+		crates = append(crates, gin.H{
+			"name":           comp.Name,
+			"newest_version": comp.Version,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"crates": crates,
+		"meta":   gin.H{"total": len(crates)},
+	})
+}
+
+func (h *Handler) handlePublish(c *gin.Context, repoName string) {
+	// Cargo publish wire format:
+	// 4 bytes LE = length of JSON metadata
+	// N bytes JSON
+	// 4 bytes LE = length of .crate tarball
+	// M bytes .crate
+	var metaLen uint32
+	if err := readU32LE(c.Request.Body, &metaLen); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid publish format"})
+		return
+	}
+	metaBytes := make([]byte, metaLen)
+	if _, err := io.ReadFull(c.Request.Body, metaBytes); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot read metadata"})
+		return
+	}
+	var meta publishMeta
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid metadata JSON"})
+		return
+	}
+
+	var crateLen uint32
+	if err := readU32LE(c.Request.Body, &crateLen); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot read crate length"})
+		return
+	}
+
+	name := strings.ToLower(meta.Name)
+	version := meta.Version
+	filename := name + "-" + version + ".crate"
+	filePath := "/api/v1/crates/" + name + "/" + version + "/" + filename
+
+	coords := base.Coords{Name: name, Version: version}
+	res, err := base.StoreArtifact(c.Request.Context(), h.deps,
+		repoName, filePath, "application/x-tar", coords,
+		io.LimitReader(c.Request.Body, int64(crateLen)), int64(crateLen))
+	if err != nil {
+		// crateLen comes from the request body itself, so a body that does not
+		// deliver it is the publisher's error, not ours — see base.ErrSizeMismatch.
+		c.JSON(base.HTTPStatusForError(err), gin.H{"error": err.Error()})
+		return
+	}
+	// The sparse index is built from these: without them a crate is served as
+	// having no dependencies and no features (#587). A publish that cannot
+	// record them fails, so the client retries instead of leaving a crate
+	// nobody can build against.
+	if err := h.deps.Components.UpdateExtra(c.Request.Context(), res.Asset.ComponentID, meta.indexExtra()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "store crate metadata: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"warnings": gin.H{"invalid_categories": []string{}, "invalid_badges": []string{}, "other": []string{}}})
+}
+
+func (h *Handler) handleDownload(c *gin.Context, repoName, p string) {
+	// /api/v1/crates/:name/:version/download
+	rest := strings.TrimSuffix(strings.TrimPrefix(p, "/api/v1/crates/"), "/download")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid path"})
+		return
+	}
+	name, version := parts[0], parts[1]
+	filename := name + "-" + version + ".crate"
+	filePath := "/api/v1/crates/" + name + "/" + version + "/" + filename
+
+	rc, asset, err := base.FetchArtifact(c.Request.Context(), h.deps, repoName, filePath)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	defer func() { _ = rc.Close() }()
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	c.DataFromReader(http.StatusOK, asset.SizeBytes, "application/x-tar", rc, nil)
+}
+
+func (h *Handler) handleYank(c *gin.Context, repoName, p string) {
+	// DELETE /api/v1/crates/:name/:version/yank
+	rest := strings.TrimSuffix(strings.TrimPrefix(p, "/api/v1/crates/"), "/yank")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid path"})
+		return
+	}
+	name, version := parts[0], parts[1]
+	filePath := "/api/v1/crates/" + name + "/" + version + "/" + name + "-" + version + ".crate"
+	if err := base.DeleteArtifact(c.Request.Context(), h.deps, repoName, filePath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// proxyCoords derives component coordinates for a proxied path. A cached crate
+// must carry its real name and version — the OSV scan queries by them, so the
+// generic path-fallback name and placeholder version made every crate pulled
+// through a Cargo proxy invisible to vulnerability scanning (#336). Index
+// entries are versionless metadata and follow the npm proxy's convention
+// (Version "metadata"). Anything else keeps the generic fallback.
+func proxyCoords(p string) base.Coords {
+	if rest, ok := strings.CutPrefix(p, "/api/v1/crates/"); ok {
+		if nv, isDownload := strings.CutSuffix(rest, "/download"); isDownload {
+			if name, version, ok := strings.Cut(nv, "/"); ok &&
+				name != "" && version != "" && !strings.Contains(version, "/") {
+				return base.Coords{Name: strings.ToLower(name), Version: version}
+			}
+		}
+	}
+	if rest, ok := strings.CutPrefix(p, "/index/"); ok && rest != "config.json" {
+		parts := strings.Split(rest, "/")
+		if name := parts[len(parts)-1]; name != "" {
+			return base.Coords{Name: strings.ToLower(name), Version: "metadata"}
+		}
+	}
+	return base.Coords{}
+}
+
+// parseDownloadPath recognizes /api/v1/crates/<name>/<version>/download.
+func parseDownloadPath(p string) (name, version string, ok bool) {
+	rest, found := strings.CutPrefix(p, "/api/v1/crates/")
+	if !found {
+		return "", "", false
+	}
+	rest, found = strings.CutSuffix(rest, "/download")
+	if !found {
+		return "", "", false
+	}
+	name, version, found = strings.Cut(rest, "/")
+	if !found || name == "" || version == "" || strings.Contains(version, "/") {
+		return "", "", false
+	}
+	return name, version, true
+}
+
+// upstreamDlBase returns the upstream registry's own download base — the "dl"
+// value of ITS /config.json — cached per repository for the metadata TTL. An
+// unreachable or unparsable config yields "", and the download falls back to
+// remote_url + the local path (correct for single-host registries).
+func (h *Handler) upstreamDlBase(ctx context.Context, repo *domain.Repository) string {
+	return h.upstreamConfig(ctx, repo).dl
+}
+
+// upstreamAPIBase returns the upstream registry's web API base — the "api"
+// value of ITS /config.json ("https://crates.io" for index.crates.io) — or ""
+// when it names none.
+func (h *Handler) upstreamAPIBase(ctx context.Context, repo *domain.Repository) string {
+	return h.upstreamConfig(ctx, repo).api
+}
+
+// upstreamConfig returns the upstream /config.json values, cached per
+// repository for the metadata TTL.
+func (h *Handler) upstreamConfig(ctx context.Context, repo *domain.Repository) dlBaseEntry {
+	h.dlMu.Lock()
+	if h.dlBases == nil {
+		h.dlBases = make(map[string]dlBaseEntry)
+	}
+	if e, ok := h.dlBases[repo.Name]; ok && time.Since(e.fetched) < repoproxy.MetadataMaxAge(repo) {
+		h.dlMu.Unlock()
+		return e
+	}
+	h.dlMu.Unlock()
+
+	e := fetchUpstreamConfig(ctx, repo)
+	e.fetched = time.Now()
+
+	h.dlMu.Lock()
+	h.dlBases[repo.Name] = e
+	h.dlMu.Unlock()
+	return e
+}
+
+func fetchUpstreamConfig(ctx context.Context, repo *domain.Repository) dlBaseEntry {
+	resp, err := repoproxy.FetchUpstreamOnce(ctx, repo, "/config.json", "", nil)
+	if err != nil {
+		return dlBaseEntry{}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return dlBaseEntry{}
+	}
+	var cfg struct {
+		Dl  string `json:"dl"`
+		API string `json:"api"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&cfg); err != nil {
+		return dlBaseEntry{}
+	}
+	absolute := func(u string) string {
+		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+			return ""
+		}
+		return u
+	}
+	return dlBaseEntry{dl: absolute(cfg.Dl), api: absolute(cfg.API)}
+}
+
+// cargoDownloadURL renders the registry's dl template for one crate. Per the
+// registry-index spec, dl may carry {crate}/{version}/{prefix}/{lowerprefix}
+// markers; a dl without any markers gets "/{crate}/{version}/download"
+// appended — exactly how cargo itself interprets it.
+func cargoDownloadURL(dl, name, version string) string {
+	if strings.Contains(dl, "{crate}") || strings.Contains(dl, "{version}") ||
+		strings.Contains(dl, "{prefix}") || strings.Contains(dl, "{lowerprefix}") {
+		out := strings.ReplaceAll(dl, "{crate}", name)
+		out = strings.ReplaceAll(out, "{version}", version)
+		out = strings.ReplaceAll(out, "{prefix}", cargoPrefix(name))
+		out = strings.ReplaceAll(out, "{lowerprefix}", cargoPrefix(strings.ToLower(name)))
+		return out
+	}
+	return strings.TrimRight(dl, "/") + "/" + name + "/" + version + "/download"
+}
+
+// cargoPrefix is the sparse-index sharding prefix ("se/rd" for serde).
+func cargoPrefix(name string) string {
+	switch {
+	case len(name) == 1:
+		return "1"
+	case len(name) == 2:
+		return "2"
+	case len(name) == 3:
+		return "3/" + name[:1]
+	default:
+		return name[:2] + "/" + name[2:4]
+	}
+}
+
+func normPath(p string) string {
+	return path.Clean("/" + strings.TrimPrefix(p, "/"))
+}
+
+// readU32LE reads a 4-byte little-endian uint32 from r.
+func readU32LE(r io.Reader, v *uint32) error {
+	b := make([]byte, 4)
+	if _, err := io.ReadFull(r, b); err != nil {
+		return err
+	}
+	*v = uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+	return nil
+}

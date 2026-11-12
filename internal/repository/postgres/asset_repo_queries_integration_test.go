@@ -1,0 +1,1638 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"testing"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/testutil/pgtest"
+)
+
+// ── globToLike (unit-style, no DB) ────────────────────────────────────────────
+
+func TestAssetRepoQueries_GlobToLike(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"*", "%"},
+		{"?", "_"},
+		{"foo*", "foo%"},
+		{"foo?bar", "foo_bar"},
+		{"*.jar", "%.jar"},
+		{"foo%bar", `foo\%bar`},  // % escaped
+		{"foo_bar", `foo\_bar`},  // _ escaped
+		{"foo%_*?", `foo\%\_%_`}, // combined escaping + glob
+		{"literal", "literal"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			got := globToLike(tc.input)
+			if got != tc.want {
+				t.Errorf("globToLike(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// ── SearchAssets ──────────────────────────────────────────────────────────────
+
+func TestAssetRepoQueries_SearchAssets_ByRepositoryName(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "sa_repo")
+	repo := NewAssetRepo(pool)
+
+	// Insert 3 assets in p's repo
+	for i := 0; i < 3; i++ {
+		a := makeAsset(p, fmt.Sprintf("/sa/file%02d.bin", i))
+		a.BlobKey = fmt.Sprintf("bk_sa_%d", i)
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+
+	// Create a second parent/repo — assets here should NOT appear
+	p2 := makeAssetParent(t, ctx, "sa_repo2")
+	a2 := makeAsset(p2, "/other/file.bin")
+	if err := repo.Create(ctx, a2); err != nil {
+		t.Fatalf("Create p2 asset: %v", err)
+	}
+
+	page, err := repo.SearchAssets(ctx, domain.SearchParams{
+		Repository: p.RepoName,
+		Limit:      50,
+	})
+	if err != nil {
+		t.Fatalf("SearchAssets: %v", err)
+	}
+	if len(page.Items) != 3 {
+		t.Errorf("expected 3 assets, got %d", len(page.Items))
+	}
+	for _, item := range page.Items {
+		if item.Repository != p.RepoName {
+			t.Errorf("unexpected repo %q in results", item.Repository)
+		}
+	}
+}
+
+func TestAssetRepoQueries_SearchAssets_ByRepositoryNames(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p1 := makeAssetParent(t, ctx, "sa_names1")
+	p2 := makeAssetParent(t, ctx, "sa_names2")
+	p3 := makeAssetParent(t, ctx, "sa_names3")
+	repo := NewAssetRepo(pool)
+
+	for _, p := range []assetParent{p1, p2, p3} {
+		a := makeAsset(p, "/file.bin")
+		a.BlobKey = "bk_" + p.RepoName
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+
+	// Search p1 and p2 but not p3
+	page, err := repo.SearchAssets(ctx, domain.SearchParams{
+		RepositoryNames: []string{p1.RepoName, p2.RepoName},
+		Limit:           50,
+	})
+	if err != nil {
+		t.Fatalf("SearchAssets: %v", err)
+	}
+	if len(page.Items) != 2 {
+		t.Errorf("expected 2 assets, got %d", len(page.Items))
+	}
+	for _, item := range page.Items {
+		if item.Repository == p3.RepoName {
+			t.Error("p3 repo should not appear in results")
+		}
+	}
+}
+
+func TestAssetRepoQueries_SearchAssets_ByNameFilter(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "sa_name")
+	repo := NewAssetRepo(pool)
+
+	paths := []string{"/mylib/foo-1.0.jar", "/mylib/foo-2.0.jar", "/mylib/bar-1.0.jar"}
+	for _, path := range paths {
+		a := makeAsset(p, path)
+		a.BlobKey = "bk" + path
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+
+	page, err := repo.SearchAssets(ctx, domain.SearchParams{
+		Repository: p.RepoName,
+		Name:       "foo",
+		Limit:      50,
+	})
+	if err != nil {
+		t.Fatalf("SearchAssets: %v", err)
+	}
+	if len(page.Items) != 2 {
+		t.Errorf("expected 2 assets matching 'foo', got %d", len(page.Items))
+	}
+}
+
+func TestAssetRepoQueries_SearchAssets_Pagination(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "sa_page")
+	repo := NewAssetRepo(pool)
+
+	for i := 0; i < 5; i++ {
+		a := makeAsset(p, fmt.Sprintf("/page/file%02d.bin", i))
+		a.BlobKey = fmt.Sprintf("bk_page_%d", i)
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+
+	// Page 1
+	page1, err := repo.SearchAssets(ctx, domain.SearchParams{Repository: p.RepoName, Limit: 2, Offset: 0})
+	if err != nil {
+		t.Fatalf("SearchAssets page1: %v", err)
+	}
+	if len(page1.Items) != 2 {
+		t.Errorf("page1: expected 2 items, got %d", len(page1.Items))
+	}
+	if page1.ContinuationToken == nil {
+		t.Error("page1: expected continuation token")
+	}
+	if *page1.ContinuationToken != "2" {
+		t.Errorf("page1: continuation token = %q, want %q", *page1.ContinuationToken, "2")
+	}
+
+	// Page 2 (offset=2)
+	page2, err := repo.SearchAssets(ctx, domain.SearchParams{Repository: p.RepoName, Limit: 2, Offset: 2})
+	if err != nil {
+		t.Fatalf("SearchAssets page2: %v", err)
+	}
+	if len(page2.Items) != 2 {
+		t.Errorf("page2: expected 2 items, got %d", len(page2.Items))
+	}
+
+	// Last page (offset=4)
+	page3, err := repo.SearchAssets(ctx, domain.SearchParams{Repository: p.RepoName, Limit: 2, Offset: 4})
+	if err != nil {
+		t.Fatalf("SearchAssets page3: %v", err)
+	}
+	if len(page3.Items) != 1 {
+		t.Errorf("page3: expected 1 item, got %d", len(page3.Items))
+	}
+	if page3.ContinuationToken != nil {
+		t.Error("page3: expected no continuation token on last page")
+	}
+}
+
+func TestAssetRepoQueries_SearchAssets_BySHA256(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "sa_sha")
+	repo := NewAssetRepo(pool)
+
+	target := "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa1111bbbb2222"
+	a := makeAsset(p, "/sha/target.bin")
+	a.BlobKey = "bk_sha_target"
+	a.SHA256 = target
+	if err := repo.Create(ctx, a); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	a2 := makeAsset(p, "/sha/other.bin")
+	a2.BlobKey = "bk_sha_other"
+	a2.SHA256 = "bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa1111bbbb2222cccc3333"
+	if err := repo.Create(ctx, a2); err != nil {
+		t.Fatalf("Create other: %v", err)
+	}
+
+	page, err := repo.SearchAssets(ctx, domain.SearchParams{
+		Repository: p.RepoName,
+		SHA256:     target,
+		Limit:      50,
+	})
+	if err != nil {
+		t.Fatalf("SearchAssets: %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("expected 1 asset by SHA256, got %d", len(page.Items))
+	}
+	if page.Items[0].SHA256 != target {
+		t.Errorf("wrong asset returned: SHA256=%q", page.Items[0].SHA256)
+	}
+}
+
+func TestAssetRepoQueries_SearchAssets_EmptyResult(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "sa_empty")
+	repo := NewAssetRepo(pool)
+
+	page, err := repo.SearchAssets(ctx, domain.SearchParams{
+		Repository: p.RepoName,
+		Limit:      50,
+	})
+	if err != nil {
+		t.Fatalf("SearchAssets: %v", err)
+	}
+	if len(page.Items) != 0 {
+		t.Errorf("expected 0 items, got %d", len(page.Items))
+	}
+	if page.ContinuationToken != nil {
+		t.Error("expected nil continuation token for empty result")
+	}
+}
+
+// ── ListAllBlobRefs (GC) ──────────────────────────────────────────────────────
+
+func TestAssetRepoQueries_ListAllBlobRefs_ReturnsDistinctKeys(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "bk_gc")
+	repo := NewAssetRepo(pool)
+
+	const sharedKey = "sha256:shared_gc_key"
+	// Two assets share one blob key; a third has a unique key.
+	for i, key := range []string{sharedKey, sharedKey, "sha256:unique_gc_key"} {
+		a := makeAsset(p, fmt.Sprintf("/gc/file%d.bin", i))
+		a.BlobKey = key
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+
+	refs, err := repo.ListAllBlobRefs(ctx)
+	if err != nil {
+		t.Fatalf("ListAllBlobRefs: %v", err)
+	}
+	keys := make([]string, 0, len(refs))
+	for _, r := range refs {
+		if r.BlobStoreID != p.BlobStoreID {
+			t.Errorf("ref %q carries store %q; want %q", r.BlobKey, r.BlobStoreID, p.BlobStoreID)
+		}
+		keys = append(keys, r.BlobKey)
+	}
+	// DISTINCT should give us exactly 2 keys
+	if len(keys) != 2 {
+		t.Errorf("expected 2 distinct keys, got %d: %v", len(keys), keys)
+	}
+	keySet := make(map[string]bool)
+	for _, k := range keys {
+		keySet[k] = true
+	}
+	if !keySet[sharedKey] {
+		t.Errorf("shared key %q not in results", sharedKey)
+	}
+	if !keySet["sha256:unique_gc_key"] {
+		t.Error("unique_gc_key not in results")
+	}
+}
+
+func TestAssetRepoQueries_ListAllBlobRefs_SkipsEmptyAndNullKeys(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "bk_empty")
+	repo := NewAssetRepo(pool)
+
+	// Asset with a real key
+	a := makeAsset(p, "/gc/realkey.bin")
+	a.BlobKey = "sha256:realkey"
+	if err := repo.Create(ctx, a); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Asset with empty blob key — stored as empty string (not NULL via nullStr, but blobKey is not nullable in the domain)
+	a2 := makeAsset(p, "/gc/nokey.bin")
+	a2.BlobKey = "" // empty string
+	if err := repo.Create(ctx, a2); err != nil {
+		t.Fatalf("Create no-key: %v", err)
+	}
+
+	refs, err := repo.ListAllBlobRefs(ctx)
+	if err != nil {
+		t.Fatalf("ListAllBlobRefs: %v", err)
+	}
+	keys := make([]string, 0, len(refs))
+	for _, r := range refs {
+		keys = append(keys, r.BlobKey)
+	}
+	// Only the real key should appear; empty string excluded by WHERE TRIM <> ''
+	for _, k := range keys {
+		if k == "" {
+			t.Error("empty blob key should not be returned")
+		}
+	}
+	if len(keys) != 1 || keys[0] != "sha256:realkey" {
+		t.Errorf("expected [sha256:realkey], got %v", keys)
+	}
+}
+
+// GC decides per store, so the store id has to come back with the key: the
+// same key can be live in one store and an abandoned migration leftover in
+// another (#297).
+func TestAssetRepoQueries_CountByBlobKeyInStore_CountsOnlyThatStore(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "bk_scoped")
+	repo := NewAssetRepo(pool)
+
+	// A second store, standing in for a migration target.
+	other := &domain.BlobStore{Name: "asset_bs_bk_scoped_other", Type: "local", Config: map[string]any{"path": "/data/other"}}
+	if err := NewBlobStoreRepo(pool).Create(ctx, other); err != nil {
+		t.Fatalf("second blob store: %v", err)
+	}
+
+	const key = "sha256:scoped_key"
+	here := makeAsset(p, "/scoped/here.bin")
+	here.BlobKey = key
+	if err := repo.Create(ctx, here); err != nil {
+		t.Fatalf("Create here: %v", err)
+	}
+	there := makeAsset(p, "/scoped/there.bin")
+	there.BlobKey = key
+	there.BlobStoreID = other.ID
+	if err := repo.Create(ctx, there); err != nil {
+		t.Fatalf("Create there: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		storeID string
+		want    int
+	}{
+		{"source store", p.BlobStoreID, 1},
+		{"target store", other.ID, 1},
+	} {
+		got, err := repo.CountByBlobKeyInStore(ctx, key, tc.storeID)
+		if err != nil {
+			t.Fatalf("CountByBlobKeyInStore(%s): %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Errorf("CountByBlobKeyInStore(%s) = %d; want %d", tc.name, got, tc.want)
+		}
+	}
+
+	// Moving the last row off the source leaves nothing referencing it there.
+	if err := repo.UpdateBlobStoreForBlobKey(ctx, key, p.RepoName, other.ID); err != nil {
+		t.Fatalf("UpdateBlobStoreForBlobKey: %v", err)
+	}
+	got, err := repo.CountByBlobKeyInStore(ctx, key, p.BlobStoreID)
+	if err != nil {
+		t.Fatalf("CountByBlobKeyInStore after move: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("after migrating every row off the source, count = %d; want 0", got)
+	}
+}
+
+// ── ListPathsByRepo ───────────────────────────────────────────────────────────
+
+func TestAssetRepoQueries_ListPathsByRepo_ReturnsDirPrefixes(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "lp_repo")
+	repo := NewAssetRepo(pool)
+
+	// /da/devops/foo.jar → should yield /da/ and /da/devops/
+	paths := []string{
+		"/da/devops/foo.jar",
+		"/da/devops/bar.jar",
+		"/releases/v1/artifact.zip",
+	}
+	for _, path := range paths {
+		a := makeAsset(p, path)
+		a.BlobKey = "bk" + path
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create %q: %v", path, err)
+		}
+	}
+
+	dirs, err := repo.ListPathsByRepo(ctx, p.RepoName, "")
+	if err != nil {
+		t.Fatalf("ListPathsByRepo: %v", err)
+	}
+
+	expected := []string{"/da/", "/da/devops/", "/releases/", "/releases/v1/"}
+	sort.Strings(dirs)
+	sort.Strings(expected)
+
+	if len(dirs) != len(expected) {
+		t.Errorf("expected dirs %v, got %v", expected, dirs)
+	} else {
+		for i := range expected {
+			if dirs[i] != expected[i] {
+				t.Errorf("dirs[%d]: got %q want %q", i, dirs[i], expected[i])
+			}
+		}
+	}
+}
+
+func TestAssetRepoQueries_ListPathsByRepo_QueryFilter(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "lp_filter")
+	repo := NewAssetRepo(pool)
+
+	paths := []string{
+		"/alpha/x.bin",
+		"/beta/y.bin",
+	}
+	for _, path := range paths {
+		a := makeAsset(p, path)
+		a.BlobKey = "bk" + path
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create %q: %v", path, err)
+		}
+	}
+
+	dirs, err := repo.ListPathsByRepo(ctx, p.RepoName, "alpha")
+	if err != nil {
+		t.Fatalf("ListPathsByRepo: %v", err)
+	}
+	if len(dirs) != 1 {
+		t.Errorf("expected 1 dir for filter 'alpha', got %v", dirs)
+	} else if dirs[0] != "/alpha/" {
+		t.Errorf("expected /alpha/, got %q", dirs[0])
+	}
+}
+
+func TestAssetRepoQueries_ListPathsByRepo_EmptyRepoReturnsEmpty(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "lp_empty")
+	repo := NewAssetRepo(pool)
+
+	dirs, err := repo.ListPathsByRepo(ctx, p.RepoName, "")
+	if err != nil {
+		t.Fatalf("ListPathsByRepo: %v", err)
+	}
+	if len(dirs) != 0 {
+		t.Errorf("expected 0 dirs, got %v", dirs)
+	}
+}
+
+// ── ListRawAssetPaths ─────────────────────────────────────────────────────────
+
+func TestAssetRepoQueries_ListRawAssetPaths_ReturnsAllPaths(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "rap")
+	repo := NewAssetRepo(pool)
+
+	want := []string{"/a/file1.bin", "/a/file2.bin", "/b/file3.bin"}
+	for _, path := range want {
+		a := makeAsset(p, path)
+		a.BlobKey = "bk" + path
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create %q: %v", path, err)
+		}
+	}
+
+	got, err := repo.ListRawAssetPaths(ctx, p.RepoName)
+	if err != nil {
+		t.Fatalf("ListRawAssetPaths: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d paths, got %d: %v", len(want), len(got), got)
+	}
+	// Results are ordered by path
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("path[%d]: got %q want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestAssetRepoQueries_ListRawAssetPaths_EmptyRepo(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "rap_empty")
+	repo := NewAssetRepo(pool)
+
+	got, err := repo.ListRawAssetPaths(ctx, p.RepoName)
+	if err != nil {
+		t.Fatalf("ListRawAssetPaths: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected 0 paths, got %v", got)
+	}
+}
+
+// ── ListRawBrowseAssets ───────────────────────────────────────────────────────
+
+func TestAssetRepoQueries_ListRawBrowseAssets_ReturnsRawFormatOnly(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	// makeAssetParent creates a "raw" format repo — this is the correct format
+	p := makeAssetParent(t, ctx, "rba_raw")
+	repo := NewAssetRepo(pool)
+
+	a := makeAsset(p, "/raw/file.bin")
+	a.BlobKey = "bk_rba_raw"
+	a.SizeBytes = 512
+	if err := repo.Create(ctx, a); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	rows, err := repo.ListRawBrowseAssets(ctx, []string{p.RepoName})
+	if err != nil {
+		t.Fatalf("ListRawBrowseAssets: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 raw browse asset, got %d", len(rows))
+	}
+	if rows[0].Path != "/raw/file.bin" {
+		t.Errorf("path: got %q want %q", rows[0].Path, "/raw/file.bin")
+	}
+	if rows[0].SizeBytes != 512 {
+		t.Errorf("size: got %d want 512", rows[0].SizeBytes)
+	}
+	if rows[0].RepoName != p.RepoName {
+		t.Errorf("repoName: got %q want %q", rows[0].RepoName, p.RepoName)
+	}
+	if rows[0].ComponentID == "" {
+		t.Error("ComponentID should not be empty")
+	}
+}
+
+func TestAssetRepoQueries_ListRawBrowseAssets_MultipleRepos(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p1 := makeAssetParent(t, ctx, "rba_multi1")
+	p2 := makeAssetParent(t, ctx, "rba_multi2")
+	repo := NewAssetRepo(pool)
+
+	a1 := makeAsset(p1, "/file1.bin")
+	a1.BlobKey = "bk_rba_1"
+	if err := repo.Create(ctx, a1); err != nil {
+		t.Fatalf("Create p1: %v", err)
+	}
+	a2 := makeAsset(p2, "/file2.bin")
+	a2.BlobKey = "bk_rba_2"
+	if err := repo.Create(ctx, a2); err != nil {
+		t.Fatalf("Create p2: %v", err)
+	}
+
+	rows, err := repo.ListRawBrowseAssets(ctx, []string{p1.RepoName, p2.RepoName})
+	if err != nil {
+		t.Fatalf("ListRawBrowseAssets: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Errorf("expected 2 rows, got %d", len(rows))
+	}
+}
+
+func TestAssetRepoQueries_ListRawBrowseAssets_EmptySliceReturnsEmpty(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+	repo := NewAssetRepo(pool)
+
+	rows, err := repo.ListRawBrowseAssets(ctx, []string{})
+	if err != nil {
+		t.Fatalf("ListRawBrowseAssets(empty): %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("expected 0 rows, got %d", len(rows))
+	}
+}
+
+// ── ListByRepoAndPath ─────────────────────────────────────────────────────────
+
+func TestAssetRepoQueries_ListByRepoAndPath_NoPrefix(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "lbrap_all")
+	repo := NewAssetRepo(pool)
+
+	paths := []string{"/a/file1.bin", "/b/file2.bin", "/c/file3.bin"}
+	for _, path := range paths {
+		a := makeAsset(p, path)
+		a.BlobKey = "bk" + path
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create %q: %v", path, err)
+		}
+	}
+
+	// Empty prefix = return all assets for repo
+	assets, err := repo.ListByRepoAndPath(ctx, p.RepoName, "")
+	if err != nil {
+		t.Fatalf("ListByRepoAndPath: %v", err)
+	}
+	if len(assets) != 3 {
+		t.Errorf("expected 3 assets, got %d", len(assets))
+	}
+}
+
+func TestAssetRepoQueries_ListByRepoAndPath_WithPrefix(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "lbrap_prefix")
+	repo := NewAssetRepo(pool)
+
+	paths := []string{"/prefix/file1.bin", "/prefix/file2.bin", "/other/file3.bin"}
+	for _, path := range paths {
+		a := makeAsset(p, path)
+		a.BlobKey = "bk" + path
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create %q: %v", path, err)
+		}
+	}
+
+	assets, err := repo.ListByRepoAndPath(ctx, p.RepoName, "/prefix")
+	if err != nil {
+		t.Fatalf("ListByRepoAndPath: %v", err)
+	}
+	if len(assets) != 2 {
+		t.Errorf("expected 2 assets under /prefix, got %d", len(assets))
+	}
+	for _, a := range assets {
+		if len(a.Path) < 7 || a.Path[:7] != "/prefix" {
+			t.Errorf("unexpected path %q returned for /prefix filter", a.Path)
+		}
+	}
+}
+
+func TestAssetRepoQueries_ListByRepoAndPath_SortedByPath(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "lbrap_sort")
+	repo := NewAssetRepo(pool)
+
+	// Insert out of order
+	for _, path := range []string{"/z/file.bin", "/a/file.bin", "/m/file.bin"} {
+		a := makeAsset(p, path)
+		a.BlobKey = "bk" + path
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create %q: %v", path, err)
+		}
+	}
+
+	assets, err := repo.ListByRepoAndPath(ctx, p.RepoName, "")
+	if err != nil {
+		t.Fatalf("ListByRepoAndPath: %v", err)
+	}
+	if len(assets) != 3 {
+		t.Fatalf("expected 3 assets, got %d", len(assets))
+	}
+	if assets[0].Path != "/a/file.bin" || assets[1].Path != "/m/file.bin" || assets[2].Path != "/z/file.bin" {
+		t.Errorf("wrong order: %v", []string{assets[0].Path, assets[1].Path, assets[2].Path})
+	}
+}
+
+// ── ListForBlobStoreMigration + UpdateBlobStoreForBlobKey ──────────────────────
+
+func TestAssetRepoQueries_ListForBlobStoreMigration_ReturnsMismatchedRows(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	// p has a source blob store
+	p := makeAssetParent(t, ctx, "bsmig_src")
+	repo := NewAssetRepo(pool)
+
+	// Create a second blob store (target)
+	bsRepo := NewBlobStoreRepo(pool)
+	targetBS := &domain.BlobStore{
+		Name:   "bsmig_target_bs",
+		Type:   "local",
+		Config: map[string]any{"path": "/data/target"},
+	}
+	if err := bsRepo.Create(ctx, targetBS); err != nil {
+		t.Fatalf("Create target blob store: %v", err)
+	}
+
+	// Two assets on source store
+	a1 := makeAsset(p, "/mig/file1.bin")
+	a1.BlobKey = "bk_mig_1"
+	a1.SizeBytes = 100
+	if err := repo.Create(ctx, a1); err != nil {
+		t.Fatalf("Create a1: %v", err)
+	}
+	a2 := makeAsset(p, "/mig/file2.bin")
+	a2.BlobKey = "bk_mig_2"
+	a2.SizeBytes = 200
+	if err := repo.Create(ctx, a2); err != nil {
+		t.Fatalf("Create a2: %v", err)
+	}
+
+	// List assets that need migration to targetBS
+	rows, err := repo.ListForBlobStoreMigration(ctx, p.RepoName, targetBS.ID)
+	if err != nil {
+		t.Fatalf("ListForBlobStoreMigration: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 migration rows, got %d", len(rows))
+	}
+	keySet := make(map[string]bool)
+	for _, r := range rows {
+		keySet[r.BlobKey] = true
+		if r.SourceBlobStoreID == "" {
+			t.Error("SourceBlobStoreID should not be empty")
+		}
+	}
+	if !keySet["bk_mig_1"] || !keySet["bk_mig_2"] {
+		t.Errorf("expected bk_mig_1 and bk_mig_2, got %v", rows)
+	}
+}
+
+func TestAssetRepoQueries_ListForBlobStoreMigration_AlreadyOnTargetExcluded(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "bsmig_same")
+	repo := NewAssetRepo(pool)
+
+	// The asset's blob_store_id == p.BlobStoreID; query with targetStoreID = p.BlobStoreID
+	a := makeAsset(p, "/mig/same.bin")
+	a.BlobKey = "bk_same"
+	if err := repo.Create(ctx, a); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	rows, err := repo.ListForBlobStoreMigration(ctx, p.RepoName, p.BlobStoreID)
+	if err != nil {
+		t.Fatalf("ListForBlobStoreMigration: %v", err)
+	}
+	// asset already on target store, should not appear
+	if len(rows) != 0 {
+		t.Errorf("expected 0 rows when asset is already on target store, got %d", len(rows))
+	}
+}
+
+func TestAssetRepoQueries_UpdateBlobStoreForBlobKey_UpdatesRows(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "ubsfbk")
+	repo := NewAssetRepo(pool)
+
+	// Create target blob store
+	bsRepo := NewBlobStoreRepo(pool)
+	newBS := &domain.BlobStore{
+		Name:   "ubsfbk_new_bs",
+		Type:   "local",
+		Config: map[string]any{"path": "/data/new"},
+	}
+	if err := bsRepo.Create(ctx, newBS); err != nil {
+		t.Fatalf("Create new blob store: %v", err)
+	}
+
+	// Create asset on original blob store
+	a := makeAsset(p, "/migrate/file.bin")
+	a.BlobKey = "bk_migrate_me"
+	if err := repo.Create(ctx, a); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Verify original blob store
+	got, err := repo.Get(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.BlobStoreID != p.BlobStoreID {
+		t.Errorf("before migration: BlobStoreID = %q, want %q", got.BlobStoreID, p.BlobStoreID)
+	}
+
+	// Update the blob_store_id
+	if err := repo.UpdateBlobStoreForBlobKey(ctx, "bk_migrate_me", p.RepoName, newBS.ID); err != nil {
+		t.Fatalf("UpdateBlobStoreForBlobKey: %v", err)
+	}
+
+	// Verify it moved
+	got2, err := repo.Get(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("Get after migration: %v", err)
+	}
+	if got2.BlobStoreID != newBS.ID {
+		t.Errorf("after migration: BlobStoreID = %q, want %q", got2.BlobStoreID, newBS.ID)
+	}
+}
+
+// ── ListStale ──────────────────────────────────────────────────────────────────
+
+// makeStaleParent creates a blob_store + repository + multiple components with
+// distinct versions, all under the same name, to test the retain-N CTE logic.
+// Returns the assetParent for the first component and the repoName.
+func makeStaleParentMultiVersion(t *testing.T, ctx context.Context, suffix string, versions []string) (p assetParent, extraCompIDs []string) {
+	t.Helper()
+	pool := pgtest.Pool(t)
+
+	bsRepo := NewBlobStoreRepo(pool)
+	bs := &domain.BlobStore{
+		Name:   "stale_bs_" + suffix,
+		Type:   "local",
+		Config: map[string]any{"path": "/data/stale_" + suffix},
+	}
+	if err := bsRepo.Create(ctx, bs); err != nil {
+		t.Fatalf("makeStaleParent: blob store: %v", err)
+	}
+
+	rRepo := NewRepositoryRepo(pool)
+	repoName := "stale_repo_" + suffix
+	r := &domain.Repository{
+		Name:        repoName,
+		Format:      domain.FormatMaven2,
+		Type:        domain.TypeHosted,
+		BlobStoreID: &bs.ID,
+		Online:      true,
+	}
+	if err := rRepo.Create(ctx, r); err != nil {
+		t.Fatalf("makeStaleParent: repository: %v", err)
+	}
+
+	cRepo := NewComponentRepo(pool)
+	var firstCompID string
+	for i, ver := range versions {
+		comp := &domain.Component{
+			RepositoryID: r.ID,
+			Format:       "maven2",
+			Group:        "com.example",
+			Name:         "mylib_" + suffix,
+			Version:      ver,
+		}
+		if err := cRepo.Create(ctx, comp); err != nil {
+			t.Fatalf("makeStaleParent: component %q: %v", ver, err)
+		}
+		if i == 0 {
+			firstCompID = comp.ID
+		} else {
+			extraCompIDs = append(extraCompIDs, comp.ID)
+		}
+	}
+
+	p = assetParent{
+		BlobStoreID:  bs.ID,
+		RepositoryID: r.ID,
+		ComponentID:  firstCompID,
+		RepoName:     repoName,
+	}
+	return p, extraCompIDs
+}
+
+func TestAssetRepoQueries_ListStale_RetainNVersions_Zero_AllCandidates(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	versions := []string{"1.0", "2.0", "3.0", "4.0"}
+	p, extraCompIDs := makeStaleParentMultiVersion(t, ctx, "retain0", versions)
+	repo := NewAssetRepo(pool)
+
+	allCompIDs := append([]string{p.ComponentID}, extraCompIDs...)
+	for i, compID := range allCompIDs {
+		a := &domain.Asset{
+			ComponentID:  compID,
+			RepositoryID: p.RepositoryID,
+			Path:         fmt.Sprintf("/com/example/mylib/retain0-%d/mylib.jar", i),
+			BlobStoreID:  p.BlobStoreID,
+			BlobKey:      fmt.Sprintf("bk_retain0_%d", i),
+			SizeBytes:    1024,
+			ContentType:  "application/java-archive",
+		}
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create asset for comp %d: %v", i, err)
+		}
+	}
+
+	// retainNVersions=0 → no retention exclusion → all 4 are candidates
+	assets, err := repo.ListStale(ctx, "maven2", []string{p.RepoName}, 0, 0, "", "", 0, 100)
+	if err != nil {
+		t.Fatalf("ListStale: %v", err)
+	}
+	if len(assets) != 4 {
+		t.Errorf("retainNVersions=0: expected 4 stale candidates, got %d", len(assets))
+	}
+}
+
+func TestAssetRepoQueries_ListStale_RetainNVersions_Two_ExcludesNewest(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	// 4 versions of the same artifact — retain the 2 newest → 2 stale remain
+	versions := []string{"1.0", "2.0", "3.0", "4.0"}
+	p, extraCompIDs := makeStaleParentMultiVersion(t, ctx, "retain2", versions)
+	repo := NewAssetRepo(pool)
+
+	allCompIDs := append([]string{p.ComponentID}, extraCompIDs...)
+	for i, compID := range allCompIDs {
+		a := &domain.Asset{
+			ComponentID:  compID,
+			RepositoryID: p.RepositoryID,
+			Path:         fmt.Sprintf("/com/example/mylib/retain2-%d/mylib.jar", i),
+			BlobStoreID:  p.BlobStoreID,
+			BlobKey:      fmt.Sprintf("bk_retain2_%d", i),
+			SizeBytes:    1024,
+			ContentType:  "application/java-archive",
+		}
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create asset for comp %d: %v", i, err)
+		}
+	}
+
+	// retainNVersions=2 → 2 newest excluded by CTE → 2 older ones are stale
+	assets, err := repo.ListStale(ctx, "maven2", []string{p.RepoName}, 0, 0, "", "", 2, 100)
+	if err != nil {
+		t.Fatalf("ListStale: %v", err)
+	}
+	if len(assets) != 2 {
+		t.Errorf("retainNVersions=2: expected 2 stale candidates, got %d", len(assets))
+	}
+}
+
+func TestAssetRepoQueries_ListStale_RetainNVersions_ExceedsCount_AllProtected(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	// Only 2 versions exist; retain 10 → nothing is stale
+	versions := []string{"1.0", "2.0"}
+	p, extraCompIDs := makeStaleParentMultiVersion(t, ctx, "retain10", versions)
+	repo := NewAssetRepo(pool)
+
+	allCompIDs := append([]string{p.ComponentID}, extraCompIDs...)
+	for i, compID := range allCompIDs {
+		a := &domain.Asset{
+			ComponentID:  compID,
+			RepositoryID: p.RepositoryID,
+			Path:         fmt.Sprintf("/com/example/mylib/retain10-%d/mylib.jar", i),
+			BlobStoreID:  p.BlobStoreID,
+			BlobKey:      fmt.Sprintf("bk_retain10_%d", i),
+			SizeBytes:    1024,
+			ContentType:  "application/java-archive",
+		}
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create asset for comp %d: %v", i, err)
+		}
+	}
+
+	assets, err := repo.ListStale(ctx, "maven2", []string{p.RepoName}, 0, 0, "", "", 10, 100)
+	if err != nil {
+		t.Fatalf("ListStale: %v", err)
+	}
+	if len(assets) != 0 {
+		t.Errorf("retainNVersions=10 with only 2 versions: expected 0 stale, got %d", len(assets))
+	}
+}
+
+func TestAssetRepoQueries_ListStale_FormatFilter(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p, _ := makeStaleParentMultiVersion(t, ctx, "stale_fmt", []string{"1.0"})
+	repo := NewAssetRepo(pool)
+
+	a := &domain.Asset{
+		ComponentID:  p.ComponentID,
+		RepositoryID: p.RepositoryID,
+		Path:         "/com/example/mylib/1.0/mylib.jar",
+		BlobStoreID:  p.BlobStoreID,
+		BlobKey:      "bk_stale_fmt",
+		SizeBytes:    1024,
+		ContentType:  "application/java-archive",
+	}
+	if err := repo.Create(ctx, a); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// format="npm" should not match maven2 component
+	assets, err := repo.ListStale(ctx, "npm", []string{p.RepoName}, 0, 0, "", "", 0, 100)
+	if err != nil {
+		t.Fatalf("ListStale npm: %v", err)
+	}
+	if len(assets) != 0 {
+		t.Errorf("format filter 'npm': expected 0, got %d", len(assets))
+	}
+
+	// format="maven2" should match
+	assets, err = repo.ListStale(ctx, "maven2", []string{p.RepoName}, 0, 0, "", "", 0, 100)
+	if err != nil {
+		t.Fatalf("ListStale maven2: %v", err)
+	}
+	if len(assets) != 1 {
+		t.Errorf("format filter 'maven2': expected 1, got %d", len(assets))
+	}
+}
+
+func TestAssetRepoQueries_ListStale_PathPrefixFilter(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p, extraCompIDs := makeStaleParentMultiVersion(t, ctx, "stale_pfx", []string{"1.0", "2.0"})
+	repo := NewAssetRepo(pool)
+
+	allCompIDs := []string{p.ComponentID, extraCompIDs[0]}
+	paths := []string{"/com/example/mylib/1.0/mylib.jar", "/other/mylib/2.0/mylib.jar"}
+	for i, compID := range allCompIDs {
+		a := &domain.Asset{
+			ComponentID:  compID,
+			RepositoryID: p.RepositoryID,
+			Path:         paths[i],
+			BlobStoreID:  p.BlobStoreID,
+			BlobKey:      fmt.Sprintf("bk_pfx_%d", i),
+			SizeBytes:    1024,
+			ContentType:  "application/java-archive",
+		}
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create %d: %v", i, err)
+		}
+	}
+
+	assets, err := repo.ListStale(ctx, "maven2", []string{p.RepoName}, 0, 0, "/com/", "", 0, 100)
+	if err != nil {
+		t.Fatalf("ListStale: %v", err)
+	}
+	if len(assets) != 1 {
+		t.Errorf("pathPrefix=/com/: expected 1 stale asset, got %d", len(assets))
+	}
+	if assets[0].Path != "/com/example/mylib/1.0/mylib.jar" {
+		t.Errorf("wrong asset: %q", assets[0].Path)
+	}
+}
+
+func TestAssetRepoQueries_ListStale_NameGlobFilter(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p, extraCompIDs := makeStaleParentMultiVersion(t, ctx, "stale_glob", []string{"1.0", "2.0"})
+	repo := NewAssetRepo(pool)
+
+	allCompIDs := []string{p.ComponentID, extraCompIDs[0]}
+	// nameGlob is applied as a LIKE against the full asset path.
+	// Use paths that start with a distinguishing prefix so the glob anchors correctly.
+	paths := []string{"mylib-stale_glob-1.0.jar", "otherlib-stale_glob-2.0.jar"}
+	for i, compID := range allCompIDs {
+		a := &domain.Asset{
+			ComponentID:  compID,
+			RepositoryID: p.RepositoryID,
+			Path:         paths[i],
+			BlobStoreID:  p.BlobStoreID,
+			BlobKey:      fmt.Sprintf("bk_glob_%d", i),
+			SizeBytes:    1024,
+			ContentType:  "application/java-archive",
+		}
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create %d: %v", i, err)
+		}
+	}
+
+	// glob "mylib*" → LIKE "mylib%" matches "mylib-stale_glob-1.0.jar" only
+	assets, err := repo.ListStale(ctx, "maven2", []string{p.RepoName}, 0, 0, "", "mylib*", 0, 100)
+	if err != nil {
+		t.Fatalf("ListStale: %v", err)
+	}
+	if len(assets) != 1 {
+		t.Errorf("nameGlob='mylib*': expected 1, got %d", len(assets))
+	}
+
+	// glob "*.jar" → LIKE "%.jar" matches both
+	assets, err = repo.ListStale(ctx, "maven2", []string{p.RepoName}, 0, 0, "", "*.jar", 0, 100)
+	if err != nil {
+		t.Fatalf("ListStale *.jar: %v", err)
+	}
+	if len(assets) != 2 {
+		t.Errorf("nameGlob='*.jar': expected 2, got %d", len(assets))
+	}
+}
+
+func TestAssetRepoQueries_ListStale_LimitRespected(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	versions := []string{"1.0", "2.0", "3.0", "4.0", "5.0"}
+	p, extraCompIDs := makeStaleParentMultiVersion(t, ctx, "stale_lim", versions)
+	repo := NewAssetRepo(pool)
+
+	allCompIDs := append([]string{p.ComponentID}, extraCompIDs...)
+	for i, compID := range allCompIDs {
+		a := &domain.Asset{
+			ComponentID:  compID,
+			RepositoryID: p.RepositoryID,
+			Path:         fmt.Sprintf("/lib/stale_lim-%d.jar", i),
+			BlobStoreID:  p.BlobStoreID,
+			BlobKey:      fmt.Sprintf("bk_lim_%d", i),
+			SizeBytes:    1024,
+			ContentType:  "application/java-archive",
+		}
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create %d: %v", i, err)
+		}
+	}
+
+	assets, err := repo.ListStale(ctx, "maven2", []string{p.RepoName}, 0, 0, "", "", 0, 3)
+	if err != nil {
+		t.Fatalf("ListStale: %v", err)
+	}
+	if len(assets) != 3 {
+		t.Errorf("limit=3: expected 3 assets, got %d", len(assets))
+	}
+}
+
+func TestAssetRepoQueries_ListStale_DefaultLimitOnZero(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p, _ := makeStaleParentMultiVersion(t, ctx, "stale_deflim", []string{"1.0"})
+	repo := NewAssetRepo(pool)
+
+	a := &domain.Asset{
+		ComponentID:  p.ComponentID,
+		RepositoryID: p.RepositoryID,
+		Path:         "/lib/deflim.jar",
+		BlobStoreID:  p.BlobStoreID,
+		BlobKey:      "bk_deflim",
+		SizeBytes:    1024,
+		ContentType:  "application/java-archive",
+	}
+	if err := repo.Create(ctx, a); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// limit=0 → code defaults to 500
+	assets, err := repo.ListStale(ctx, "maven2", []string{p.RepoName}, 0, 0, "", "", 0, 0)
+	if err != nil {
+		t.Fatalf("ListStale limit=0: %v", err)
+	}
+	if len(assets) != 1 {
+		t.Errorf("expected 1 asset (default limit=500), got %d", len(assets))
+	}
+}
+
+func TestAssetRepoQueries_ListStale_WildcardFormat(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p, _ := makeStaleParentMultiVersion(t, ctx, "stale_wild", []string{"1.0"})
+	repo := NewAssetRepo(pool)
+
+	a := &domain.Asset{
+		ComponentID:  p.ComponentID,
+		RepositoryID: p.RepositoryID,
+		Path:         "/lib/wild.jar",
+		BlobStoreID:  p.BlobStoreID,
+		BlobKey:      "bk_wild",
+		SizeBytes:    1024,
+		ContentType:  "application/java-archive",
+	}
+	if err := repo.Create(ctx, a); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// format="*" = wildcard (all formats)
+	assets, err := repo.ListStale(ctx, "*", []string{p.RepoName}, 0, 0, "", "", 0, 100)
+	if err != nil {
+		t.Fatalf("ListStale *: %v", err)
+	}
+	if len(assets) != 1 {
+		t.Errorf("wildcard format: expected 1 asset, got %d", len(assets))
+	}
+}
+
+func TestAssetRepoQueries_ListStale_EmptyRepoNames_ReturnsEmpty(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+	repo := NewAssetRepo(pool)
+
+	// No repo names provided → WHERE clause has no repo filter → empty result
+	assets, err := repo.ListStale(ctx, "*", []string{}, 0, 0, "", "", 0, 100)
+	if err != nil {
+		t.Fatalf("ListStale empty repos: %v", err)
+	}
+	if len(assets) != 0 {
+		t.Errorf("empty repoNames: expected 0 assets, got %d", len(assets))
+	}
+}
+
+// ── ListByComponentIDs ────────────────────────────────────────────────────────
+
+func TestAssetRepoQueries_ListByComponentIDs_GroupsByComponentID(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	// Two separate parent chains (each has its own component).
+	p1 := makeAssetParent(t, ctx, "lbcids_a")
+	p2 := makeAssetParent(t, ctx, "lbcids_b")
+	repo := NewAssetRepo(pool)
+
+	// Seed 2 assets under component 1 in REVERSE lexical order (file2 before file1).
+	// This ensures the test catches a missing ORDER BY: without it, the DB may
+	// return rows in insertion order, which would be descending — not ascending.
+	for _, path := range []string{"/a/file2.bin", "/a/file1.bin"} {
+		a := makeAsset(p1, path)
+		a.BlobKey = "bk" + path
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create p1 %q: %v", path, err)
+		}
+	}
+	// Component 2: seed in normal order (exercises the regular case).
+	for _, path := range []string{"/b/file1.bin", "/b/file2.bin"} {
+		a := makeAsset(p2, path)
+		a.BlobKey = "bk" + path
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create p2 %q: %v", path, err)
+		}
+	}
+
+	byID, err := repo.ListByComponentIDs(ctx, []string{p1.ComponentID, p2.ComponentID})
+	if err != nil {
+		t.Fatalf("ListByComponentIDs: %v", err)
+	}
+
+	if len(byID) != 2 {
+		t.Fatalf("expected 2 keys in map, got %d", len(byID))
+	}
+
+	for _, cid := range []string{p1.ComponentID, p2.ComponentID} {
+		slice, ok := byID[cid]
+		if !ok {
+			t.Errorf("component %q missing from result map", cid)
+			continue
+		}
+		if len(slice) != 2 {
+			t.Errorf("component %q: expected 2 assets, got %d", cid, len(slice))
+		}
+	}
+
+	// Verify path ordering within each component's slice is ascending.
+	// p1 was inserted in reverse order (file2, file1) — ORDER BY must reorder it.
+	s1 := byID[p1.ComponentID]
+	if len(s1) == 2 {
+		wantPaths := []string{"/a/file1.bin", "/a/file2.bin"}
+		if s1[0].Path != wantPaths[0] || s1[1].Path != wantPaths[1] {
+			t.Errorf("p1 assets not sorted ascending by path: got [%q, %q], want %v",
+				s1[0].Path, s1[1].Path, wantPaths)
+		}
+	}
+	s2 := byID[p2.ComponentID]
+	if len(s2) == 2 && s2[0].Path >= s2[1].Path {
+		t.Errorf("p2 assets not sorted by path: %q >= %q", s2[0].Path, s2[1].Path)
+	}
+}
+
+func TestAssetRepoQueries_ListByComponentIDs_UnknownIDAbsent(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "lbcids_unk")
+	repo := NewAssetRepo(pool)
+
+	a := makeAsset(p, "/file.bin")
+	a.BlobKey = "bk_lbcids_unk"
+	if err := repo.Create(ctx, a); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Request p's real ID plus a made-up UUID.
+	const unknownID = "00000000-0000-0000-0000-000000000000"
+	byID, err := repo.ListByComponentIDs(ctx, []string{p.ComponentID, unknownID})
+	if err != nil {
+		t.Fatalf("ListByComponentIDs: %v", err)
+	}
+
+	if _, ok := byID[unknownID]; ok {
+		t.Error("unknown component ID should not appear in the result map")
+	}
+	if len(byID[p.ComponentID]) != 1 {
+		t.Errorf("expected 1 asset for known component, got %d", len(byID[p.ComponentID]))
+	}
+}
+
+func TestAssetRepoQueries_ListByComponentIDs_EmptyInput_ReturnsEmptyMap(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+	repo := NewAssetRepo(pool)
+
+	byID, err := repo.ListByComponentIDs(ctx, []string{})
+	if err != nil {
+		t.Fatalf("ListByComponentIDs(empty): %v", err)
+	}
+	if len(byID) != 0 {
+		t.Errorf("expected empty map for empty input, got %d keys", len(byID))
+	}
+}
+
+// ── ListOCIImageNames ─────────────────────────────────────────────────────────
+
+// The catalog endpoint is built on this query, so what it must never do is name
+// something a client cannot pull: a layer, or an image whose upload was
+// abandoned before its manifest. Both leave assets behind under /blobs/.
+func TestAssetRepoQueries_ListOCIImageNames_OnlyImagesWithManifests(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "oci_names")
+	repo := NewAssetRepo(pool)
+
+	const dgst = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	paths := []string{
+		// One image under two tags plus the digest alias every tagged push
+		// registers: three assets, one name.
+		"/manifests/library/ubuntu/latest",
+		"/manifests/library/ubuntu/22.04",
+		"/manifests/library/ubuntu/" + dgst,
+		// A single-segment image name, and a sibling whose name contains
+		// another's in full.
+		"/manifests/myapp/1.0",
+		"/manifests/charts/nginx/1.2.3",
+		"/manifests/charts/nginx-extra/1.0.0",
+		// Blobs name nothing: a layer of an image that is listed, and one of an
+		// upload that never got a manifest.
+		"/blobs/library/ubuntu/" + dgst,
+		"/blobs/aborted/upload/" + dgst,
+	}
+	for _, path := range paths {
+		if err := repo.Create(ctx, makeAsset(p, path)); err != nil {
+			t.Fatalf("Create %q: %v", path, err)
+		}
+	}
+
+	got, err := repo.ListOCIImageNames(ctx, []string{p.RepoName})
+	if err != nil {
+		t.Fatalf("ListOCIImageNames: %v", err)
+	}
+	sort.Strings(got)
+	want := []string{"charts/nginx", "charts/nginx-extra", "library/ubuntu", "myapp"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("name[%d]: got %q want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// Each repository is its own registry namespace, so one repository's images must
+// never appear in another's catalog.
+func TestAssetRepoQueries_ListOCIImageNames_ScopedToTheNamedRepositories(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p1 := makeAssetParent(t, ctx, "oci_scope1")
+	p2 := makeAssetParent(t, ctx, "oci_scope2")
+	repo := NewAssetRepo(pool)
+
+	if err := repo.Create(ctx, makeAsset(p1, "/manifests/only/in-one/1.0")); err != nil {
+		t.Fatalf("Create in repo 1: %v", err)
+	}
+	if err := repo.Create(ctx, makeAsset(p2, "/manifests/only/in-two/1.0")); err != nil {
+		t.Fatalf("Create in repo 2: %v", err)
+	}
+
+	got, err := repo.ListOCIImageNames(ctx, []string{p1.RepoName})
+	if err != nil {
+		t.Fatalf("ListOCIImageNames(repo1): %v", err)
+	}
+	if len(got) != 1 || got[0] != "only/in-one" {
+		t.Fatalf("repo1 must list only its own image, got %v", got)
+	}
+
+	both, err := repo.ListOCIImageNames(ctx, []string{p1.RepoName, p2.RepoName})
+	if err != nil {
+		t.Fatalf("ListOCIImageNames(both): %v", err)
+	}
+	sort.Strings(both)
+	if len(both) != 2 || both[0] != "only/in-one" || both[1] != "only/in-two" {
+		t.Fatalf("both repositories must contribute, got %v", both)
+	}
+}
+
+func TestAssetRepoQueries_ListOCIImageNames_EmptyInputs(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "oci_empty")
+	repo := NewAssetRepo(pool)
+
+	none, err := repo.ListOCIImageNames(ctx, []string{p.RepoName})
+	if err != nil {
+		t.Fatalf("ListOCIImageNames(empty repo): %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("an empty repository holds no images, got %v", none)
+	}
+
+	noRepos, err := repo.ListOCIImageNames(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListOCIImageNames(no repos): %v", err)
+	}
+	if len(noRepos) != 0 {
+		t.Errorf("no repositories means no images, got %v", noRepos)
+	}
+}
+
+func TestAssetRepoQueries_ListByRepoAndPath_PrefixIsLiteral(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+
+	p := makeAssetParent(t, ctx, "lbrap_literal")
+	repo := NewAssetRepo(pool)
+
+	// "_" is the Conan placeholder for an absent user/channel, and package
+	// names routinely carry one; "%" can reach a path prefix through a
+	// percent-encoded request segment. Both are LIKE metacharacters.
+	paths := []string{
+		"/v2/conans/my_lib/1.0/_/_/revisions/r1/files/conanfile.py",
+		"/v2/conans/myXlib/1.0/a/b/revisions/r1/files/conanfile.py",
+	}
+	for _, path := range paths {
+		a := makeAsset(p, path)
+		a.BlobKey = "bk" + path
+		if err := repo.Create(ctx, a); err != nil {
+			t.Fatalf("Create %q: %v", path, err)
+		}
+	}
+
+	got, err := repo.ListByRepoAndPath(ctx, p.RepoName, "/v2/conans/my_lib/1.0/_/_/")
+	if err != nil {
+		t.Fatalf("ListByRepoAndPath: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("underscore prefix matched %d assets, want 1: %v", len(got), pathsOf(got))
+	}
+
+	got, err = repo.ListByRepoAndPath(ctx, p.RepoName, "/v2/conans/%/%/%/%/")
+	if err != nil {
+		t.Fatalf("ListByRepoAndPath: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("percent prefix matched %d assets, want 0: %v", len(got), pathsOf(got))
+	}
+}
+
+func pathsOf(assets []domain.Asset) []string {
+	out := make([]string, 0, len(assets))
+	for _, a := range assets {
+		out = append(out, a.Path)
+	}
+	return out
+}
+
+// makeOCIImageRepo lays out one image the way the docker/oci handler does: every
+// layer, config and digest alias is its own component named after the image,
+// next to the tag manifests. Rows are created oldest first: v1, then v2, which
+// reuses v1's base layer.
+func makeOCIImageRepo(t *testing.T, ctx context.Context, suffix string, repoType domain.RepoType) (repoName string) {
+	t.Helper()
+	pool := pgtest.Pool(t)
+
+	bs := &domain.BlobStore{Name: "oci_bs_" + suffix, Type: "local", Config: map[string]any{"path": "/data/oci_" + suffix}}
+	if err := NewBlobStoreRepo(pool).Create(ctx, bs); err != nil {
+		t.Fatalf("blob store: %v", err)
+	}
+	repoName = "oci_repo_" + suffix
+	r := &domain.Repository{Name: repoName, Format: domain.FormatDocker, Type: repoType, BlobStoreID: &bs.ID, Online: true}
+	if err := NewRepositoryRepo(pool).Create(ctx, r); err != nil {
+		t.Fatalf("repository: %v", err)
+	}
+
+	rows := []struct{ version, path string }{
+		{"sha256:base", "/blobs/bb/sha256:base"},
+		{"sha256:cfg1", "/blobs/bb/sha256:cfg1"},
+		{"sha256:man1", "/manifests/bb/sha256:man1"},
+		{"v1", "/manifests/bb/v1"},
+		{"sha256:top", "/blobs/bb/sha256:top"},
+		{"sha256:cfg2", "/blobs/bb/sha256:cfg2"},
+		{"sha256:man2", "/manifests/bb/sha256:man2"},
+		{"v2", "/manifests/bb/v2"},
+	}
+	cRepo, aRepo := NewComponentRepo(pool), NewAssetRepo(pool)
+	for i, row := range rows {
+		comp := &domain.Component{RepositoryID: r.ID, Format: "docker", Name: "bb", Version: row.version}
+		if err := cRepo.Create(ctx, comp); err != nil {
+			t.Fatalf("component %q: %v", row.version, err)
+		}
+		a := &domain.Asset{
+			ComponentID: comp.ID, RepositoryID: r.ID, Path: row.path, BlobStoreID: bs.ID,
+			BlobKey: fmt.Sprintf("bk_oci_%s_%d", suffix, i), SizeBytes: 1024,
+		}
+		if err := aRepo.Create(ctx, a); err != nil {
+			t.Fatalf("asset %q: %v", row.path, err)
+		}
+	}
+	return repoName
+}
+
+func stalePaths(assets []domain.Asset) []string {
+	out := make([]string, 0, len(assets))
+	for _, a := range assets {
+		out = append(out, a.Path)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// #596: on a hosted registry only tag manifests are releases. Layers, configs
+// and digest aliases are still referenced by live tags, so neither the age
+// filter nor retention may pick them, and they do not count toward N.
+func TestAssetRepoQueries_ListStale_HostedOCI_OnlyTagManifests(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+	repoName := makeOCIImageRepo(t, ctx, "hosted", domain.TypeHosted)
+	repo := NewAssetRepo(pool)
+
+	all, err := repo.ListStale(ctx, "docker", []string{repoName}, 0, 0, "", "", 0, 100)
+	if err != nil {
+		t.Fatalf("ListStale: %v", err)
+	}
+	if got, want := fmt.Sprint(stalePaths(all)), "[/manifests/bb/v1 /manifests/bb/v2]"; got != want {
+		t.Errorf("no retention: candidates = %s, want %s", got, want)
+	}
+
+	retain1, err := repo.ListStale(ctx, "docker", []string{repoName}, 0, 0, "", "", 1, 100)
+	if err != nil {
+		t.Fatalf("ListStale retain 1: %v", err)
+	}
+	if got, want := fmt.Sprint(stalePaths(retain1)), "[/manifests/bb/v1]"; got != want {
+		t.Errorf("retain 1: candidates = %s, want %s", got, want)
+	}
+
+	retain2, err := repo.ListStale(ctx, "docker", []string{repoName}, 0, 0, "", "", 2, 100)
+	if err != nil {
+		t.Fatalf("ListStale retain 2: %v", err)
+	}
+	if len(retain2) != 0 {
+		t.Errorf("retain 2: candidates = %v, want none", stalePaths(retain2))
+	}
+}
+
+// A proxy's cached layers stay evictable: a cold layer is re-fetched from
+// upstream, and excluding them would let the cache grow without bound.
+func TestAssetRepoQueries_ListStale_ProxyOCI_LayersStayEvictable(t *testing.T) {
+	pool := pgtest.Pool(t)
+	pgtest.Truncate(t, pool, "blob_stores", "repositories", "components")
+	ctx := context.Background()
+	repoName := makeOCIImageRepo(t, ctx, "proxy", domain.TypeProxy)
+
+	all, err := NewAssetRepo(pool).ListStale(ctx, "docker", []string{repoName}, 0, 0, "", "", 0, 100)
+	if err != nil {
+		t.Fatalf("ListStale: %v", err)
+	}
+	if len(all) != 8 {
+		t.Errorf("proxy: %d candidates, want all 8: %v", len(all), stalePaths(all))
+	}
+}

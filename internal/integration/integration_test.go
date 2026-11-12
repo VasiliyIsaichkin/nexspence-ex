@@ -1,0 +1,566 @@
+//go:build integration
+
+// Package integration contains end-to-end tests that boot the real router over
+// a real PostgreSQL database (started automatically via dockertest, like the
+// repository-layer integration tests). Run with:
+//
+//	go test ./internal/integration/... -tags integration -v
+package integration
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/nexspence-oss/nexspence/internal/api"
+	"github.com/nexspence-oss/nexspence/internal/auth"
+	"github.com/nexspence-oss/nexspence/internal/config"
+	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
+	"github.com/nexspence-oss/nexspence/internal/logger"
+	"github.com/nexspence-oss/nexspence/internal/repository/postgres"
+	"github.com/nexspence-oss/nexspence/internal/testutil/pgtest"
+)
+
+var (
+	serverOnce sync.Once
+	testServer *httptest.Server
+)
+
+// server boots the full application once per test binary: a migrated postgres
+// from pgtest, the real router, and an HTTP listener whose address is also the
+// configured BaseURL — proxy handlers rewrite upstream URLs onto it, so it
+// must be the address clients actually reach.
+func server(t *testing.T) *httptest.Server {
+	t.Helper()
+	serverOnce.Do(func() {
+		pool := pgtest.Pool(t)
+
+		// The seed migration pre-creates the admin user with a placeholder
+		// hash; the configured password is normally applied by the server
+		// binary's bootstrap step, which lives in package main — set it here.
+		authSvc := auth.NewService("integration-test-secret-32bytes!!", 1, 4)
+		hash, err := authSvc.HashPassword("admin123")
+		if err != nil {
+			t.Fatalf("hash admin password: %v", err)
+		}
+		if err := postgres.NewUserRepo(pool).UpdatePassword(context.Background(), "admin", hash); err != nil {
+			t.Fatalf("set admin password: %v", err)
+		}
+		// UpdatePassword bumps tokens_valid_after, and a JWT's second-granular
+		// iat issued within the same second reads as pre-cutoff — harmless for
+		// humans, fatal for a test that logs in milliseconds later. Rewind it.
+		if _, err := pool.Exec(context.Background(),
+			`UPDATE users SET tokens_valid_after = now() - interval '1 minute' WHERE username = 'admin'`); err != nil {
+			t.Fatalf("rewind token cutoff: %v", err)
+		}
+
+		l, lerr := net.Listen("tcp", "127.0.0.1:0")
+		if lerr != nil {
+			t.Fatalf("listen: %v", lerr)
+		}
+		baseURL := "http://" + l.Addr().String()
+
+		cfg := &config.Config{}
+		cfg.Auth.JWTSecret = "integration-test-secret-32bytes!!"
+		cfg.Auth.JWTExpiryHours = 1
+		cfg.Auth.BcryptCost = 4
+		// Production gets this from the viper default; a zero-value config
+		// here would mean "not wired" and skip the min-length enforcement.
+		cfg.Auth.PasswordMinLength = 8
+		cfg.Storage.Local.BasePath = t.TempDir()
+		cfg.HTTP.BaseURL = baseURL
+		cfg.HTTP.MaxBodyMB = 64 // a zero-value config means "0 bytes", not "unlimited"
+		cfg.Log.Level = "error"
+		cfg.Bootstrap.AdminUsername = "admin"
+		cfg.Bootstrap.AdminPassword = "admin123"
+		cfg.Bootstrap.AdminEmail = "admin@test.local"
+		// Production's default. It is the instance-wide half of the anonymous
+		// switch; without it every allow_anonymous repository still refuses an
+		// unauthenticated read, and the public-read tests below would pass for
+		// the wrong reason.
+		cfg.Auth.AnonymousEnabled = true
+		// Auto-promotion (#542) with a window short enough for a test to wait
+		// out, but long enough that a two-file deploy settles as one.
+		cfg.Promotion.AutoSettleWindow = 500 * time.Millisecond
+		cfg.Promotion.AutoPollInterval = 100 * time.Millisecond
+
+		log := logger.New("error", "json")
+		handler := api.NewRouter(context.Background(), cfg, pool, log, "integration-test")
+
+		ts := httptest.NewUnstartedServer(handler)
+		_ = ts.Listener.Close()
+		ts.Listener = l
+		ts.Start()
+		testServer = ts
+	})
+	if testServer == nil {
+		t.Fatal("integration server failed to start")
+	}
+	return testServer
+}
+
+func TestMain(m *testing.M) {
+	// The proxy-format tests point repositories at loopback httptest fakes;
+	// the production upstream client is SSRF-guarded and would refuse them.
+	repoproxy.UpstreamClient = &http.Client{}
+
+	code := m.Run()
+	if testServer != nil {
+		testServer.Close()
+	}
+	pgtest.Cleanup()
+	os.Exit(code)
+}
+
+// login returns a Bearer token for the given credentials.
+func login(t *testing.T, username, password string) string {
+	t.Helper()
+	body := fmt.Sprintf(`{"username":%q,"password":%q}`, username, password)
+	resp, err := http.Post(server(t).URL+"/api/v1/login", "application/json", bytes.NewBufferString(body))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "login response: %s", raw)
+
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(raw, &result))
+	token, ok := result["token"].(string)
+	require.True(t, ok, "response missing token")
+	return token
+}
+
+func authReq(t *testing.T, method, path string, body io.Reader, token string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, server(t).URL+path, body)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+// ── Tests ─────────────────────────────────────────────────────
+
+func TestStatusCheck(t *testing.T) {
+	resp, err := http.Get(server(t).URL + "/service/rest/v1/status/check")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestLoginAndMe(t *testing.T) {
+	token := login(t, "admin", "admin123")
+	assert.NotEmpty(t, token)
+
+	resp := authReq(t, http.MethodGet, "/api/v1/me", nil, token)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var me map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&me))
+	assert.Equal(t, "admin", me["username"])
+}
+
+// TestSelfChangePassword covers the profile-modal flow end to end: a local
+// user changes their own password, the change revokes the caller's own JWT
+// (tokens_valid_after is bumped server-side), and only the new password
+// logs in afterwards.
+func TestSelfChangePassword(t *testing.T) {
+	admin := login(t, "admin", "admin123")
+
+	body := `{"userId":"pw-change-eve","emailAddress":"pw-change-eve@example.com","password":"firstPass123!","status":"active","roles":[]}`
+	createResp := authReq(t, http.MethodPost, "/service/rest/v1/security/users", bytes.NewBufferString(body), admin)
+	createResp.Body.Close()
+	require.Equal(t, http.StatusCreated, createResp.StatusCode)
+	t.Cleanup(func() {
+		d := authReq(t, http.MethodDelete, "/service/rest/v1/security/users/pw-change-eve", nil, admin)
+		d.Body.Close()
+	})
+	// Same second-granularity tokens_valid_after race as TestAssetGetByID.
+	_, err := pgtest.Pool(t).Exec(context.Background(),
+		`UPDATE users SET tokens_valid_after = now() - interval '1 minute' WHERE username = 'pw-change-eve'`)
+	require.NoError(t, err)
+
+	eve := login(t, "pw-change-eve", "firstPass123!")
+
+	// Too short for the wired default minimum (8) — refused before any write.
+	shortResp := authReq(t, http.MethodPut, "/api/v1/me/change-password",
+		bytes.NewBufferString(`{"oldPassword":"firstPass123!","newPassword":"tiny"}`), eve)
+	shortResp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, shortResp.StatusCode)
+
+	chgResp := authReq(t, http.MethodPut, "/api/v1/me/change-password",
+		bytes.NewBufferString(`{"oldPassword":"firstPass123!","newPassword":"secondPass456!"}`), eve)
+	chgResp.Body.Close()
+	require.Equal(t, http.StatusNoContent, chgResp.StatusCode)
+
+	// The change revoked every session, including the caller's own — a live
+	// UI would 401 on its next call, which is why it logs the user out.
+	meResp := authReq(t, http.MethodGet, "/api/v1/me", nil, eve)
+	meResp.Body.Close()
+	assert.Equal(t, http.StatusUnauthorized, meResp.StatusCode)
+
+	// The login path must also see the revocation (second-granularity iat
+	// would otherwise let a token minted in the same second pass).
+	_, err = pgtest.Pool(t).Exec(context.Background(),
+		`UPDATE users SET tokens_valid_after = now() - interval '1 minute' WHERE username = 'pw-change-eve'`)
+	require.NoError(t, err)
+
+	oldLogin, err := http.Post(server(t).URL+"/api/v1/login", "application/json",
+		bytes.NewBufferString(`{"username":"pw-change-eve","password":"firstPass123!"}`))
+	require.NoError(t, err)
+	oldLogin.Body.Close()
+	assert.Equal(t, http.StatusUnauthorized, oldLogin.StatusCode)
+
+	newToken := login(t, "pw-change-eve", "secondPass456!")
+	require.NotEmpty(t, newToken)
+}
+
+// TestAdminSelfChangePassword covers the profile modal for an nx-admin: the
+// self route verifies the current password whatever the caller's role. The
+// handler used to branch on the role and send an admin's own change through
+// the no-old-password admin verb, so the current password the form asks for
+// was accepted with any value.
+func TestAdminSelfChangePassword(t *testing.T) {
+	admin := login(t, "admin", "admin123")
+
+	// The users API binds role IDs, not role names.
+	rolesResp := authReq(t, http.MethodGet, "/service/rest/v1/security/roles", nil, admin)
+	rawRoles, err := io.ReadAll(rolesResp.Body)
+	rolesResp.Body.Close()
+	require.NoError(t, err)
+	var roles []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	require.NoError(t, json.Unmarshal(rawRoles, &roles))
+	adminRoleID := ""
+	for _, role := range roles {
+		if role.Name == "nx-admin" {
+			adminRoleID = role.ID
+		}
+	}
+	require.NotEmpty(t, adminRoleID, "nx-admin role: %s", rawRoles)
+
+	body := fmt.Sprintf(`{"userId":"pw-admin-eve","emailAddress":"pw-admin-eve@example.com","password":"firstPass123!","status":"active","roles":[%q]}`, adminRoleID)
+	createResp := authReq(t, http.MethodPost, "/service/rest/v1/security/users", bytes.NewBufferString(body), admin)
+	rawCreate, _ := io.ReadAll(createResp.Body)
+	createResp.Body.Close()
+	require.Equal(t, http.StatusCreated, createResp.StatusCode, "create: %s", rawCreate)
+	t.Cleanup(func() {
+		d := authReq(t, http.MethodDelete, "/service/rest/v1/security/users/pw-admin-eve", nil, admin)
+		d.Body.Close()
+	})
+	// Same second-granularity tokens_valid_after race as TestAssetGetByID.
+	_, err = pgtest.Pool(t).Exec(context.Background(),
+		`UPDATE users SET tokens_valid_after = now() - interval '1 minute' WHERE username = 'pw-admin-eve'`)
+	require.NoError(t, err)
+
+	eve := login(t, "pw-admin-eve", "firstPass123!")
+
+	wrongResp := authReq(t, http.MethodPut, "/api/v1/me/change-password",
+		bytes.NewBufferString(`{"oldPassword":"not-the-password","newPassword":"attackerPass789!"}`), eve)
+	wrongResp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, wrongResp.StatusCode,
+		"an admin's own change must still verify the current password")
+
+	// The refused attempt wrote nothing: the original password still logs in.
+	require.NotEmpty(t, login(t, "pw-admin-eve", "firstPass123!"))
+
+	// With the right current password the same route works.
+	okResp := authReq(t, http.MethodPut, "/api/v1/me/change-password",
+		bytes.NewBufferString(`{"oldPassword":"firstPass123!","newPassword":"secondPass456!"}`), eve)
+	okResp.Body.Close()
+	require.Equal(t, http.StatusNoContent, okResp.StatusCode)
+
+	_, err = pgtest.Pool(t).Exec(context.Background(),
+		`UPDATE users SET tokens_valid_after = now() - interval '1 minute' WHERE username = 'pw-admin-eve'`)
+	require.NoError(t, err)
+	require.NotEmpty(t, login(t, "pw-admin-eve", "secondPass456!"))
+}
+
+// TestAdminResetsLocalUserPassword covers the other half of the feature: an
+// admin resets someone else's local password without supplying the old one,
+// the old password stops working and the new one logs in.
+func TestAdminResetsLocalUserPassword(t *testing.T) {
+	admin := login(t, "admin", "admin123")
+
+	body := `{"userId":"pw-reset-bob","emailAddress":"pw-reset-bob@example.com","password":"firstPass123!","status":"active","roles":[]}`
+	createResp := authReq(t, http.MethodPost, "/service/rest/v1/security/users", bytes.NewBufferString(body), admin)
+	createResp.Body.Close()
+	require.Equal(t, http.StatusCreated, createResp.StatusCode)
+	t.Cleanup(func() {
+		d := authReq(t, http.MethodDelete, "/service/rest/v1/security/users/pw-reset-bob", nil, admin)
+		d.Body.Close()
+	})
+	_, err := pgtest.Pool(t).Exec(context.Background(),
+		`UPDATE users SET tokens_valid_after = now() - interval '1 minute' WHERE username = 'pw-reset-bob'`)
+	require.NoError(t, err)
+	require.NotEmpty(t, login(t, "pw-reset-bob", "firstPass123!"))
+
+	rst := authReq(t, http.MethodPut, "/service/rest/v1/security/users/pw-reset-bob/change-password",
+		bytes.NewBufferString(`{"newPassword":"adminSetPass456!"}`), admin)
+	rst.Body.Close()
+	require.Equal(t, http.StatusNoContent, rst.StatusCode)
+
+	_, err = pgtest.Pool(t).Exec(context.Background(),
+		`UPDATE users SET tokens_valid_after = now() - interval '1 minute' WHERE username = 'pw-reset-bob'`)
+	require.NoError(t, err)
+
+	oldLogin, err := http.Post(server(t).URL+"/api/v1/login", "application/json",
+		bytes.NewBufferString(`{"username":"pw-reset-bob","password":"firstPass123!"}`))
+	require.NoError(t, err)
+	oldLogin.Body.Close()
+	assert.Equal(t, http.StatusUnauthorized, oldLogin.StatusCode, "the old password must stop working")
+
+	require.NotEmpty(t, login(t, "pw-reset-bob", "adminSetPass456!"))
+}
+
+func TestRepositoryCRUD(t *testing.T) {
+	token := login(t, "admin", "admin123")
+
+	// Create hosted raw repo
+	createBody := `{"name":"integration-raw","online":true,"storage":{"blobStoreName":"default","strictContentTypeValidation":false}}`
+	resp := authReq(t, http.MethodPost, "/service/rest/v1/repositories/raw/hosted",
+		bytes.NewBufferString(createBody), token)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	// List repos — should contain the new one
+	listResp := authReq(t, http.MethodGet, "/service/rest/v1/repositories", nil, token)
+	defer listResp.Body.Close()
+	assert.Equal(t, http.StatusOK, listResp.StatusCode)
+
+	// Get by name
+	getResp := authReq(t, http.MethodGet, "/service/rest/v1/repositories/integration-raw", nil, token)
+	defer getResp.Body.Close()
+	assert.Equal(t, http.StatusOK, getResp.StatusCode)
+
+	// Delete
+	delResp := authReq(t, http.MethodDelete, "/service/rest/v1/repositories/integration-raw", nil, token)
+	defer delResp.Body.Close()
+	assert.Equal(t, http.StatusNoContent, delResp.StatusCode)
+}
+
+func TestRawArtifactPushPull(t *testing.T) {
+	token := login(t, "admin", "admin123")
+
+	// Create repo
+	createBody := `{"name":"e2e-raw","online":true,"storage":{"blobStoreName":"default","strictContentTypeValidation":false}}`
+	resp := authReq(t, http.MethodPost, "/service/rest/v1/repositories/raw/hosted",
+		bytes.NewBufferString(createBody), token)
+	resp.Body.Close()
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	// Push artifact
+	artifactData := []byte("integration test artifact content")
+	putReq, _ := http.NewRequest(http.MethodPut,
+		server(t).URL+"/repository/e2e-raw/integration/test/artifact.bin",
+		bytes.NewReader(artifactData))
+	putReq.Header.Set("Authorization", "Bearer "+token)
+	putReq.Header.Set("Content-Type", "application/octet-stream")
+	putReq.ContentLength = int64(len(artifactData))
+	putResp, err := http.DefaultClient.Do(putReq)
+	require.NoError(t, err)
+	putResp.Body.Close()
+	assert.Equal(t, http.StatusCreated, putResp.StatusCode)
+
+	// Pull artifact
+	getResp := authReq(t, http.MethodGet,
+		"/repository/e2e-raw/integration/test/artifact.bin", nil, token)
+	defer getResp.Body.Close()
+	assert.Equal(t, http.StatusOK, getResp.StatusCode)
+
+	pulled, err := io.ReadAll(getResp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, artifactData, pulled)
+
+	// Cleanup
+	delResp := authReq(t, http.MethodDelete, "/service/rest/v1/repositories/e2e-raw", nil, token)
+	delResp.Body.Close()
+}
+
+// SearchAssets/FilterAssets filter what they return through RBAC; the direct
+// GET /service/rest/v1/assets/:id endpoint didn't, letting any authenticated
+// user who knew or enumerated an asset UUID from a private repository read
+// its full metadata and download URL. 404, not 403, keeps the id unguessable.
+func TestAssetGetByID_DeniedWithoutPrivilege(t *testing.T) {
+	admin := login(t, "admin", "admin123")
+
+	createBody := `{"name":"e2e-asset-rbac","online":true,"storage":{"blobStoreName":"default","strictContentTypeValidation":false}}`
+	resp := authReq(t, http.MethodPost, "/service/rest/v1/repositories/raw/hosted", bytes.NewBufferString(createBody), admin)
+	resp.Body.Close()
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	t.Cleanup(func() {
+		d := authReq(t, http.MethodDelete, "/service/rest/v1/repositories/e2e-asset-rbac", nil, admin)
+		d.Body.Close()
+	})
+
+	putReq, _ := http.NewRequest(http.MethodPut,
+		server(t).URL+"/repository/e2e-asset-rbac/secret.bin", bytes.NewReader([]byte("shh")))
+	putReq.Header.Set("Authorization", "Bearer "+admin)
+	putReq.Header.Set("Content-Type", "application/octet-stream")
+	putResp, err := http.DefaultClient.Do(putReq)
+	require.NoError(t, err)
+	putResp.Body.Close()
+	require.Equal(t, http.StatusCreated, putResp.StatusCode)
+
+	searchResp := authReq(t, http.MethodGet, "/service/rest/v1/search/assets?repository=e2e-asset-rbac", nil, admin)
+	defer searchResp.Body.Close()
+	require.Equal(t, http.StatusOK, searchResp.StatusCode)
+	var page struct {
+		Items []struct {
+			ID string `json:"id"`
+		} `json:"items"`
+	}
+	require.NoError(t, json.NewDecoder(searchResp.Body).Decode(&page))
+	require.Len(t, page.Items, 1)
+	assetID := page.Items[0].ID
+
+	userBody := `{"userId":"asset-rbac-eve","firstName":"Eve","lastName":"NoPriv","emailAddress":"asset-rbac-eve@example.com","password":"evePass123!","status":"active","roles":[]}`
+	createUserResp := authReq(t, http.MethodPost, "/service/rest/v1/security/users", bytes.NewBufferString(userBody), admin)
+	createUserResp.Body.Close()
+	require.Equal(t, http.StatusCreated, createUserResp.StatusCode)
+	t.Cleanup(func() {
+		d := authReq(t, http.MethodDelete, "/service/rest/v1/security/users/asset-rbac-eve", nil, admin)
+		d.Body.Close()
+	})
+	// Same second-granularity race as the admin setup in server(): a freshly
+	// created user's tokens_valid_after defaults to now(), and logging in
+	// milliseconds later can produce a JWT whose iat reads as pre-cutoff.
+	_, err = pgtest.Pool(t).Exec(context.Background(),
+		`UPDATE users SET tokens_valid_after = now() - interval '1 minute' WHERE username = 'asset-rbac-eve'`)
+	require.NoError(t, err)
+
+	eve := login(t, "asset-rbac-eve", "evePass123!")
+
+	deniedResp := authReq(t, http.MethodGet, "/service/rest/v1/assets/"+assetID, nil, eve)
+	defer deniedResp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, deniedResp.StatusCode)
+
+	allowedResp := authReq(t, http.MethodGet, "/service/rest/v1/assets/"+assetID, nil, admin)
+	defer allowedResp.Body.Close()
+	assert.Equal(t, http.StatusOK, allowedResp.StatusCode)
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	token := login(t, "admin", "admin123")
+	resp := authReq(t, http.MethodGet, "/api/v1/metrics", nil, token)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var snap map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&snap))
+	assert.Contains(t, snap, "requests_total")
+	assert.Contains(t, snap, "uptime_seconds")
+}
+
+// ── Anonymous browsing (#404) ─────────────────────────────────
+
+// anonReq issues a request with no Authorization header at all.
+func anonReq(t *testing.T, path string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, server(t).URL+path, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+// Nexus lets a visitor browse public repositories without signing in, and the
+// read endpoints the web UI is built on refused an unauthenticated caller with
+// a 401 before this — so the UI had no choice but to gate everything behind a
+// login. They now run OptionalAuth and let RBAC decide, which means a
+// repository is visible anonymously only when it carries allow_anonymous.
+func TestAnonymousBrowse_SeesOnlyPublicRepositories(t *testing.T) {
+	token := login(t, "admin", "admin123")
+
+	for _, r := range []struct {
+		name string
+		anon bool
+	}{{"anon-public", true}, {"anon-private", false}} {
+		body := fmt.Sprintf(
+			`{"name":%q,"online":true,"allowAnonymous":%t,"storage":{"blobStoreName":"default","strictContentTypeValidation":false}}`,
+			r.name, r.anon)
+		resp := authReq(t, http.MethodPost, "/service/rest/v1/repositories/raw/hosted",
+			bytes.NewBufferString(body), token)
+		resp.Body.Close()
+		require.Equal(t, http.StatusCreated, resp.StatusCode, "create %s", r.name)
+		t.Cleanup(func() {
+			del := authReq(t, http.MethodDelete, "/service/rest/v1/repositories/"+r.name, nil, token)
+			del.Body.Close()
+		})
+	}
+
+	t.Run("list shows the public repo and hides the private one", func(t *testing.T) {
+		resp := anonReq(t, "/api/v1/repositories")
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var repos []map[string]any
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&repos))
+		names := map[string]bool{}
+		for _, r := range repos {
+			names[fmt.Sprint(r["name"])] = true
+		}
+		assert.True(t, names["anon-public"], "public repo missing from the anonymous listing")
+		assert.False(t, names["anon-private"], "private repo leaked into the anonymous listing")
+	})
+
+	t.Run("get by name answers for the public repo only", func(t *testing.T) {
+		pub := anonReq(t, "/service/rest/v1/repositories/anon-public")
+		defer pub.Body.Close()
+		assert.Equal(t, http.StatusOK, pub.StatusCode)
+
+		// 404 rather than 401/403: the name stays unguessable, and the caller
+		// is never told to go and authenticate for something they cannot see.
+		priv := anonReq(t, "/service/rest/v1/repositories/anon-private")
+		defer priv.Body.Close()
+		assert.Equal(t, http.StatusNotFound, priv.StatusCode)
+	})
+
+	t.Run("browse and search answer anonymously", func(t *testing.T) {
+		tree := anonReq(t, "/api/v1/browse/repositories/anon-public/path-tree")
+		defer tree.Body.Close()
+		assert.Equal(t, http.StatusOK, tree.StatusCode)
+
+		search := anonReq(t, "/service/rest/v1/search?repository=anon-public")
+		defer search.Body.Close()
+		assert.Equal(t, http.StatusOK, search.StatusCode)
+
+		components := anonReq(t, "/service/rest/v1/components?repository=anon-public")
+		defer components.Body.Close()
+		assert.Equal(t, http.StatusOK, components.StatusCode)
+	})
+
+	// Everything that is not a public read still demands a token.
+	t.Run("writes and user-scoped endpoints still require auth", func(t *testing.T) {
+		for _, path := range []string{"/api/v1/me", "/api/v1/tokens", "/service/rest/v1/security/roles"} {
+			resp := anonReq(t, path)
+			resp.Body.Close()
+			assert.Equal(t, http.StatusUnauthorized, resp.StatusCode, "%s answered anonymously", path)
+		}
+		req, err := http.NewRequest(http.MethodDelete,
+			server(t).URL+"/api/v1/browse/repositories/anon-public/path?path=/x", nil)
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode, "anonymous delete was not refused")
+	})
+}
