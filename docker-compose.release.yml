@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nexspence
+      POSTGRES_USER: nexspence
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "nexspence", "-d", "nexspence"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  nexspence:
+    image: "${NEXSPENCE_IMAGE:-ghcr.io/vasiliyisaichkin/nexspence-ex:2.13.1-1}"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      NEXSPENCE_DATABASE_DSN: "postgres://nexspence@postgres:5432/nexspence?sslmode=disable"
+      PGPASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}"
+      NEXSPENCE_BOOTSTRAP_ADMIN_PASSWORD: "${NEXSPENCE_BOOTSTRAP_ADMIN_PASSWORD:?Set NEXSPENCE_BOOTSTRAP_ADMIN_PASSWORD}"
+      NEXSPENCE_HTTP_BASE_URL: "${NEXSPENCE_HTTP_BASE_URL:-http://localhost:8081}"
+      NEXSPENCE_STORAGE_LOCAL_BASE_PATH: /app/data/blobs
+    ports:
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/service/rest/v1/status/check"]
+      interval: 5s
+      timeout: 5s
+      retries: 18
+      start_period: 10s
+    volumes:
+      - nexspence_blobs:/app/data/blobs
+      - nexspence_secrets:/app/secrets
+
+volumes:
+  postgres_data:
+  nexspence_blobs:
+  nexspence_secrets:

@@ -4,6 +4,18 @@ Nexspence EX `2.13.1-1` — модифицированная версия [Nexsp
 
 В форке добавлены постраничная загрузка Docker и npm Browse, фильтрация OCI-каталога по правам, поддержка нескольких адресов реестра и оптимизация загрузки OCI-слоёв в S3.
 
+## Запуск готового Docker-образа
+
+Для запуска через [Docker Compose](docker-compose.release.yml) задайте в файле `.env` два независимых пароля `POSTGRES_PASSWORD` и `NEXSPENCE_BOOTSTRAP_ADMIN_PASSWORD`. Сохраните `.env` для повторных запусков с теми же томами.
+
+```sh
+docker compose -f docker-compose.release.yml up -d --wait
+```
+
+Интерфейс доступен на http://localhost:8081. Для первого входа используйте пользователя `admin` и пароль `NEXSPENCE_BOOTSTRAP_ADMIN_PASSWORD`.
+
+GitHub Actions собирает образ из Git-тега для Linux amd64, запускает его с PostgreSQL и публикует в `ghcr.io/vasiliyisaichkin/nexspence-ex`. Для повторной сборки существующего тега запустите workflow **Docker image** вручную и укажите тег.
+
 <div align="center">
   <img src="https://nexspence.com/assets/logo.png" alt="Nexspence" width="380">
   <br><br>
